@@ -103,15 +103,22 @@ The core domain model does not know about a database, agent framework, embedding
 
 ## Quick start
 
-Synapse currently targets **Rust 1.82+**.
+Synapse currently targets **Rust 1.82+**. The quickest way to try it is to clone the repository, install the CLI locally, and use a disposable store.
+
+### 1. Build and install the CLI
 
 ```bash
 git clone https://github.com/Jervis-UMTC/synapse.git
 cd synapse
-cargo build --workspace
+cargo install --path crates/synapse-cli
+synapse --version
 ```
 
-Use an isolated store while experimenting.
+If you do not want to install the binary, replace `synapse` in the examples below with `cargo run -p synapse-cli --`.
+
+### 2. Use an isolated store
+
+For a first run, point Synapse at a directory inside the checkout so the experiment is easy to inspect or remove.
 
 **Linux/macOS:**
 
@@ -125,41 +132,85 @@ export SYNAPSE_STORE="$PWD/.synapse-demo"
 $env:SYNAPSE_STORE = "$PWD/.synapse-demo"
 ```
 
-Bootstrap one writer identity:
+Without `SYNAPSE_STORE`, Synapse uses the normal per-user data directory: `%LOCALAPPDATA%\\Synapse` on Windows, `$HOME/Library/Application Support/Synapse` on macOS, and `$XDG_DATA_HOME/synapse` or `$HOME/.local/share/synapse` on other Unix systems.
+
+### 3. Bootstrap a writer
+
+A new store needs an authorized local writer before it accepts authoritative records. This command initializes the store policy and grants `inspector` permission to write records and lifecycle relations:
 
 ```bash
-cargo run -p synapse-cli -- authorization init inspector
+synapse authorization init inspector
 ```
 
-Persist an observation:
+Use the same client ID as the `source` in the write commands that follow.
+
+### 4. Publish useful knowledge
+
+Store an observation with both an immutable record ID and a stable logical address:
 
 ```bash
-cargo run -p synapse-cli -- knowledge add rust-toolchain fact inspector observed high "Rust is installed" --scope machine --key toolchain.rust.compiler_path
+synapse knowledge add rust-toolchain fact inspector observed high "Rust is installed" --scope machine --key toolchain.rust.compiler_path
 ```
 
-Retrieve it from a separate invocation:
+The record ID identifies this historical assertion. The optional `scope + key` pair identifies what the assertion is about, so another unrelated tool can look up the same fact without knowing the record ID or matching the prose.
+
+### 5. Read it from another process
+
+Read by immutable ID:
 
 ```bash
-cargo run -p synapse-cli -- knowledge show rust-toolchain
+synapse knowledge show rust-toolchain
 ```
 
-Or retrieve the logical fact without knowing the record ID or matching its prose:
+Or discover the current fact by logical address:
 
 ```bash
-cargo run -p synapse-cli -- knowledge find --scope machine --key toolchain.rust.compiler_path
+synapse knowledge find --scope machine --key toolchain.rust.compiler_path
 ```
 
-`scope + key` is an address, not a uniqueness constraint. If unrelated tools publish multiple active records at the same address, Synapse returns the matching records rather than silently deciding which writer is correct.
-
-When a fact changes, publish the successor and the supersession assertion together instead of exposing a two-step replacement window:
+Free-text discovery is also available:
 
 ```bash
-cargo run -p synapse-cli -- knowledge replace rust-toolchain-v2 fact inspector observed high "Rust moved to a new toolchain path" rust-toolchain-moved rust-toolchain --scope machine --key toolchain.rust.compiler_path
+synapse knowledge find "Rust"
 ```
 
-The old record remains readable as history, but normal current discovery resolves it as superseded as soon as the combined replacement becomes authoritative.
+`scope + key` is not a uniqueness constraint. If several active records share an address, Synapse returns the matching records instead of silently choosing a winner.
 
-A new standalone record file uses an explicit versioned JSON envelope, for example:
+### 6. Replace a fact without deleting history
+
+When the fact changes, publish the successor and its `supersedes` relation atomically:
+
+```bash
+synapse knowledge replace rust-toolchain-v2 fact inspector observed high "Rust moved to a new toolchain path" rust-toolchain-moved rust-toolchain --scope machine --key toolchain.rust.compiler_path
+```
+
+Normal current discovery now returns the successor. The old record remains readable as history, and its resolved lifecycle state can be inspected with:
+
+```bash
+synapse knowledge status rust-toolchain
+```
+
+### Common commands
+
+| Command | Purpose |
+| --- | --- |
+| `synapse authorization init <client-id>` | Initialize one store and bootstrap its first writer. |
+| `synapse knowledge add ...` | Persist a new immutable knowledge record. |
+| `synapse knowledge find [<text>] [filters]` | Discover current knowledge by text or metadata such as `scope` and `key`. |
+| `synapse knowledge show <id>` | Read one immutable record exactly by ID. |
+| `synapse knowledge status <id>` | Read a record plus its effective lifecycle state and relation evidence. |
+| `synapse knowledge replace ...` | Atomically publish a successor and supersede one older record. |
+| `synapse knowledge relate ...` | Append an explicit `supersedes` or `conflicts` relation. |
+| `synapse knowledge index rebuild` | Rebuild the bounded derived retrieval index. |
+| `synapse ipc serve` | Run the authenticated local IPC service. |
+| `synapse ipc trust <client-id> <executable>` | Trust one executable fingerprint for IPC writes as a client. |
+| `synapse ipc ping` | Check that the local IPC service is reachable. |
+
+Run `synapse` with no arguments to print the complete command grammar.
+
+### What gets stored
+
+A new addressed standalone record is persisted in an explicit versioned JSON envelope, for example:
 
 ```json
 {
@@ -182,9 +233,7 @@ A new standalone record file uses an explicit versioned JSON envelope, for examp
 }
 ```
 
-Legacy flat v0.1 record JSON remains readable. Addressless records retain schema version 1; records with paired `scope + key` addressing use schema version 2 so older formats cannot silently discard the address.
-
-`created_at_unix_ms` is supplied at runtime; `0` above is only a shortened documentation example.
+Legacy flat v0.1 record JSON remains readable. Addressless records retain schema version 1; records with paired `scope + key` addressing use schema version 2 so older formats cannot silently discard the address. `created_at_unix_ms` is supplied at runtime; `0` above is only a shortened documentation example.
 
 ## Authenticated local IPC
 
