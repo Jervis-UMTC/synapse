@@ -22,3 +22,7 @@ All notable user-visible changes to Synapse will be documented in this file. Syn
 
 - Authoritative writes fail closed on invalid authorization, ambiguous executable trust, corrupt persistence, relation cycles, and bounded-capacity violations.
 - Direct filesystem access remains an administrative/trusted path and is not yet isolated by a dedicated service account or enforced store ACLs.
+
+### Fixed
+
+- Normalize OS-reported IPC peer process IDs with checked conversion so authenticated IPC compiles safely on Unix as well as Windows.

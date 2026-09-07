@@ -642,8 +642,16 @@ fn require_source(claimed: &str, authenticated: &str) -> Result<(), IpcError> {
 fn authenticate_peer(store: &FileStore, stream: &Stream) -> Result<String, IpcError> {
     let creds = stream.peer_creds()?;
     let pid = creds.pid().ok_or(IpcError::PeerProcessIdUnavailable)?;
+    let pid = normalize_peer_pid(pid)?;
     let fingerprint = fingerprint_process(pid)?;
     trusted_client_for_fingerprint(store, &fingerprint)
+}
+
+fn normalize_peer_pid<T>(pid: T) -> Result<u32, IpcError>
+where
+    u32: TryFrom<T>,
+{
+    u32::try_from(pid).map_err(|_| IpcError::PeerProcessIdUnavailable)
 }
 
 fn fingerprint_process(pid: u32) -> Result<String, IpcError> {
@@ -950,6 +958,22 @@ fn create_private_dir_all(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_pid_conversion_is_checked_across_platform_integer_types() {
+        assert_eq!(
+            normalize_peer_pid(42_u32).expect("u32 pid should remain valid"),
+            42
+        );
+        assert_eq!(
+            normalize_peer_pid(42_i32).expect("positive Unix pid should convert"),
+            42
+        );
+        assert!(matches!(
+            normalize_peer_pid(-1_i32),
+            Err(IpcError::PeerProcessIdUnavailable)
+        ));
+    }
 
     fn endpoint_test_root(label: &str) -> PathBuf {
         let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
