@@ -194,6 +194,7 @@ synapse knowledge status rust-toolchain
 
 | Command | Purpose |
 | --- | --- |
+| `synapse doctor` | Inspect bounded store health and fail closed on structural corruption. |
 | `synapse authorization init <client-id>` | Initialize one store and bootstrap its first writer. |
 | `synapse knowledge add ...` | Persist a new immutable knowledge record. |
 | `synapse knowledge find [<text>] [filters]` | Discover current knowledge by text or metadata such as `scope` and `key`. |
@@ -207,6 +208,14 @@ synapse knowledge status rust-toolchain
 | `synapse ipc ping` | Check that the local IPC service is reachable. |
 
 Run `synapse` with no arguments to print the complete command grammar.
+
+To check a store without repairing or rewriting authoritative knowledge:
+
+```bash
+synapse doctor
+```
+
+A healthy store reports its record/relation counts, authorization and identity configuration, and derived-index status. Missing optional configuration is informational; malformed authoritative state fails the command. See [Store diagnostics](docs/operations/doctor.md) for the exact checks and limits.
 
 ### What gets stored
 
@@ -325,6 +334,9 @@ Architecture and operational contracts are documented under `docs/` and kept in 
 - [Knowledge evolution](docs/architecture/evolution.md)
 - [Local write authorization](docs/architecture/authorization.md)
 - [Authenticated local IPC](docs/architecture/ipc.md)
+- [Store diagnostics (`synapse doctor`)](docs/operations/doctor.md)
+
+Project process and maintenance documents are also available in [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CHANGELOG.md](CHANGELOG.md).
 
 ## Development
 
@@ -332,13 +344,15 @@ Run the full repository gates before submitting a change:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-The workspace forbids unsafe Rust and treats Clippy's `all` lint group as warnings; CI-equivalent verification promotes warnings to errors with `-D warnings`.
+The workspace forbids unsafe Rust and treats Clippy's `all` lint group as warnings; CI promotes warnings to errors with `-D warnings`. GitHub Actions runs the workspace tests on Linux, macOS, and Windows and separately verifies the declared Rust 1.82 minimum supported version.
 
 ## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, change guidelines, required verification, and pull-request expectations. Security-sensitive reports should follow [SECURITY.md](SECURITY.md) instead of a public issue.
 
 Synapse is intentionally small and early enough for contributors to shape it. Focused issues and pull requests are welcome, especially around:
 

@@ -16,6 +16,10 @@ struct StoreIdentityFile {
     id: String,
 }
 
+pub(super) fn load_existing(store: &FileStore) -> Result<Option<String>, StoreError> {
+    Ok(load(store)?.map(|identity| identity.id))
+}
+
 pub(super) fn load_or_initialize(store: &FileStore) -> Result<String, StoreError> {
     if let Some(identity) = load(store)? {
         return Ok(identity.id);

@@ -182,6 +182,75 @@ fn record_with(
 }
 
 #[test]
+fn store_inspection_does_not_create_a_missing_store() {
+    let directory = TestDir::unconfigured();
+    let missing = directory.path().join("not-created-yet");
+    let inspection = FileStore::new(&missing)
+        .inspect()
+        .expect("missing store inspection should succeed");
+
+    assert!(!inspection.root_exists);
+    assert_eq!(inspection.store_id, None);
+    assert_eq!(inspection.authorization_clients, None);
+    assert_eq!(inspection.record_count, 0);
+    assert_eq!(inspection.relation_count, 0);
+    assert!(!inspection.index_ready);
+    assert_eq!(inspection.index_entry_count, None);
+    assert!(!missing.exists());
+}
+
+#[test]
+fn store_inspection_validates_records_relations_index_and_configuration() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("old", "old compiler path"))
+        .expect("old record should persist");
+    store
+        .insert(&record("new", "new compiler path"))
+        .expect("new record should persist");
+    store
+        .insert_relation(&relation(
+            "new-over-old",
+            "new",
+            KnowledgeRelationKind::Supersedes,
+            "old",
+        ))
+        .expect("relation should persist");
+    let store_id = store.store_id().expect("identity should initialize");
+
+    let inspection = store.inspect().expect("store should inspect cleanly");
+    assert!(inspection.root_exists);
+    assert_eq!(inspection.store_id.as_deref(), Some(store_id.as_str()));
+    assert_eq!(inspection.authorization_clients, Some(12));
+    assert_eq!(inspection.record_count, 2);
+    assert_eq!(inspection.relation_count, 1);
+    assert!(inspection.index_ready);
+    assert_eq!(inspection.index_entry_count, Some(2));
+}
+
+#[test]
+fn store_inspection_fails_closed_on_a_corrupt_ready_index() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("indexed", "indexed value"))
+        .expect("record should persist");
+    let index_entry = fs::read_dir(directory.path().join("index-v1"))
+        .expect("index directory should exist")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("idx"))
+        .expect("index entry should exist");
+    fs::write(index_entry, b"corrupt-index-entry").expect("index fixture should be corrupted");
+
+    let error = store
+        .inspect()
+        .expect_err("corrupt ready index must fail store inspection");
+    assert!(matches!(error, StoreError::CorruptIndex { .. }));
+}
+
+#[test]
 fn store_identity_is_created_once_and_persisted() {
     let directory = TestDir::unconfigured();
     let store = FileStore::new(directory.path());

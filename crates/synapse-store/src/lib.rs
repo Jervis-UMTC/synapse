@@ -11,6 +11,7 @@ mod successor;
 pub use authorization::{AuthorizationPolicy, ClientAuthorization, InvalidAuthorizationPolicy};
 
 use std::{
+    collections::HashSet,
     error::Error,
     ffi::OsStr,
     fmt, fs,
@@ -40,6 +41,18 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub struct FileStore {
     root: PathBuf,
+}
+
+/// Bounded structural health information for one local Synapse store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreInspection {
+    pub root_exists: bool,
+    pub store_id: Option<String>,
+    pub authorization_clients: Option<usize>,
+    pub record_count: usize,
+    pub relation_count: usize,
+    pub index_ready: bool,
+    pub index_entry_count: Option<usize>,
 }
 
 /// A bounded lexical query over persisted knowledge.
@@ -99,6 +112,9 @@ pub struct KnowledgeStatus {
 #[derive(Debug)]
 pub enum StoreError {
     Io(io::Error),
+    InvalidStoreRoot {
+        reason: String,
+    },
     AlreadyExists {
         id: String,
     },
@@ -194,6 +210,9 @@ impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "storage I/O error: {error}"),
+            Self::InvalidStoreRoot { reason } => {
+                write!(formatter, "invalid Synapse store root: {reason}")
+            }
             Self::AlreadyExists { id } => {
                 write!(formatter, "knowledge record '{id}' already exists")
             }
@@ -335,6 +354,56 @@ impl FileStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Inspect the bounded structural health of this store without repairing or rewriting knowledge.
+    pub fn inspect(&self) -> Result<StoreInspection, StoreError> {
+        let metadata = match fs::metadata(&self.root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(StoreInspection {
+                    root_exists: false,
+                    store_id: None,
+                    authorization_clients: None,
+                    record_count: 0,
+                    relation_count: 0,
+                    index_ready: false,
+                    index_entry_count: None,
+                });
+            }
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        if !metadata.is_dir() {
+            return Err(StoreError::InvalidStoreRoot {
+                reason: format!("'{}' is not a directory", self.root.display()),
+            });
+        }
+
+        let _state_lock = state_lock::shared(self)?;
+        let record_ids = self.record_ids_for_inspection()?;
+        let graph = evolution::RelationGraph::load(self)?;
+        let authorization_clients = match authorization::load(self) {
+            Ok(policy) => Some(policy.clients.len()),
+            Err(StoreError::AuthorizationNotConfigured) => None,
+            Err(error) => return Err(error),
+        };
+        let store_id = identity::load_existing(self)?;
+        let index_ready = index::is_ready(self)?;
+        let index_entry_count = if index_ready {
+            Some(index::validate(self, &record_ids)?)
+        } else {
+            None
+        };
+
+        Ok(StoreInspection {
+            root_exists: true,
+            store_id,
+            authorization_clients,
+            record_count: record_ids.len(),
+            relation_count: graph.relation_count(),
+            index_ready,
+            index_entry_count,
+        })
     }
 
     /// Read the durable store identifier, creating it once when absent.
@@ -525,7 +594,7 @@ impl FileStore {
 
     /// Build the durable derived retrieval index for an existing file store.
     pub fn rebuild_index(&self) -> Result<usize, StoreError> {
-        let _state_lock = state_lock::shared(self)?;
+        let _state_lock = state_lock::exclusive(self)?;
         index::rebuild(self)
     }
 
@@ -614,6 +683,58 @@ impl FileStore {
             }
         }
         Ok(matches)
+    }
+
+    fn record_ids_for_inspection(&self) -> Result<Vec<String>, StoreError> {
+        let mut ids = HashSet::new();
+        match fs::read_dir(self.records_dir()) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let Some(id) = record_id_from_file_name(&entry.file_name()) else {
+                        continue;
+                    };
+                    ids.insert(id);
+                    if ids.len() > index::MAX_INDEX_RECORDS {
+                        return Err(StoreError::IndexCapacityExceeded {
+                            max_records: index::MAX_INDEX_RECORDS,
+                        });
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+
+        for id in successor::record_ids(self)? {
+            if !ids.insert(id.clone()) {
+                return Err(StoreError::CorruptRecord {
+                    id,
+                    reason: "record id exists in both standalone and atomic-successor storage"
+                        .to_owned(),
+                });
+            }
+            if ids.len() > index::MAX_INDEX_RECORDS {
+                return Err(StoreError::IndexCapacityExceeded {
+                    max_records: index::MAX_INDEX_RECORDS,
+                });
+            }
+        }
+
+        let mut ids = ids.into_iter().collect::<Vec<_>>();
+        ids.sort();
+        for id in &ids {
+            if self.read_record_with_serialized(id)?.is_none() {
+                return Err(StoreError::CorruptRecord {
+                    id: id.clone(),
+                    reason: "authoritative record disappeared during store inspection".to_owned(),
+                });
+            }
+        }
+        Ok(ids)
     }
 
     pub(crate) fn record_storage_exists(&self, id: &str) -> Result<bool, StoreError> {

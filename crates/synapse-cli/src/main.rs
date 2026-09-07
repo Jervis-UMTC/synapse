@@ -27,6 +27,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
 
+    if args.first().map(String::as_str) == Some("doctor") {
+        if args.len() != 1 {
+            return Err(usage());
+        }
+        return doctor();
+    }
+
     if args.first().map(String::as_str) == Some("authorization") {
         return match args.get(1).map(String::as_str) {
             Some("init") => initialize_authorization(&args[2..]),
@@ -53,6 +60,45 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
 
     Err(usage())
+}
+
+fn doctor() -> Result<(), String> {
+    let root = store_root()?;
+    let inspection = FileStore::new(&root)
+        .inspect()
+        .map_err(|error| format!("Synapse doctor failed: {error}"))?;
+
+    println!("Synapse doctor");
+    if !inspection.root_exists {
+        println!("Store root: INFO not initialized ({})", root.display());
+        println!("Authorization: INFO not configured");
+        println!("Records: OK 0");
+        println!("Relations: OK 0");
+        println!("Index: INFO not built");
+        println!("Store identity: INFO not initialized");
+        println!("Overall: OK (no store initialized)");
+        return Ok(());
+    }
+
+    println!("Store root: OK {}", root.display());
+    match inspection.authorization_clients {
+        Some(1) => println!("Authorization: OK 1 client"),
+        Some(clients) => println!("Authorization: OK {clients} clients"),
+        None => println!("Authorization: INFO not configured"),
+    }
+    println!("Records: OK {}", inspection.record_count);
+    println!("Relations: OK {}", inspection.relation_count);
+    match inspection.index_entry_count {
+        Some(1) => println!("Index: OK ready (1 entry)"),
+        Some(entries) => println!("Index: OK ready ({entries} entries)"),
+        None => println!("Index: INFO not built"),
+    }
+    match inspection.store_id {
+        Some(id) => println!("Store identity: OK {id}"),
+        None => println!("Store identity: INFO not initialized"),
+    }
+    println!("Overall: OK");
+    Ok(())
 }
 
 fn initialize_authorization(args: &[String]) -> Result<(), String> {
@@ -525,6 +571,7 @@ fn nonempty_env_path(name: &str) -> Option<PathBuf> {
 fn usage() -> String {
     concat!(
         "usage: synapse --version | ",
+        "synapse doctor | ",
         "synapse authorization init <client-id> | ",
         "synapse ipc serve [--once] | synapse ipc trust <client-id> <executable-path> | synapse ipc ping | ",
         "synapse knowledge create <id> <kind> <source> <observed|inferred> <unknown|low|medium|high> <content> [--scope <scope> --key <key>] | ",

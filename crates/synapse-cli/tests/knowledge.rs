@@ -73,6 +73,90 @@ fn one_shot_ipc_server(store: &Path) -> Child {
 }
 
 #[test]
+fn doctor_reports_a_missing_store_without_creating_it() {
+    let parent = TestDir::unconfigured();
+    let missing = parent.path().join("not-initialized");
+    let output = synapse(Some(&missing))
+        .arg("doctor")
+        .output()
+        .expect("synapse doctor should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("doctor output should be utf-8");
+    assert!(stdout.contains("Store root: INFO not initialized"));
+    assert!(stdout.contains("Overall: OK (no store initialized)"));
+    assert!(!missing.exists());
+}
+
+#[test]
+fn doctor_reports_configured_store_health() {
+    let directory = TestDir::new();
+    let add = synapse(Some(directory.path()))
+        .args([
+            "knowledge",
+            "add",
+            "doctor-record",
+            "fact",
+            "inspector",
+            "observed",
+            "high",
+            "doctor health value",
+        ])
+        .output()
+        .expect("knowledge add should run");
+    assert!(add.status.success());
+
+    let output = synapse(Some(directory.path()))
+        .arg("doctor")
+        .output()
+        .expect("synapse doctor should run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("doctor output should be utf-8");
+    assert!(stdout.contains("Authorization: OK 4 clients"));
+    assert!(stdout.contains("Records: OK 1"));
+    assert!(stdout.contains("Relations: OK 0"));
+    assert!(stdout.contains("Index: OK ready (1 entry)"));
+    assert!(stdout.contains("Store identity: INFO not initialized"));
+    assert!(stdout.contains("Overall: OK"));
+}
+
+#[test]
+fn doctor_fails_closed_on_a_corrupt_ready_index() {
+    let directory = TestDir::new();
+    let add = synapse(Some(directory.path()))
+        .args([
+            "knowledge",
+            "add",
+            "doctor-corrupt-record",
+            "fact",
+            "inspector",
+            "observed",
+            "high",
+            "doctor corrupt value",
+        ])
+        .output()
+        .expect("knowledge add should run");
+    assert!(add.status.success());
+
+    let index_entry = fs::read_dir(directory.path().join("index-v1"))
+        .expect("index directory should exist")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("idx"))
+        .expect("index entry should exist");
+    fs::write(index_entry, b"corrupt-index-entry").expect("index fixture should be corrupted");
+
+    let output = synapse(Some(directory.path()))
+        .arg("doctor")
+        .output()
+        .expect("synapse doctor should run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("doctor stderr should be utf-8");
+    assert!(stderr.contains("Synapse doctor failed:"));
+    assert!(stderr.contains("knowledge retrieval index is invalid"));
+}
+
+#[test]
 fn knowledge_create_emits_a_serialized_record() {
     let output = synapse(None)
         .args([

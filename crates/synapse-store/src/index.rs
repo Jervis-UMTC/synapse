@@ -19,7 +19,7 @@ const READY_CONTENT: &[u8] = b"SYNAPSE_INDEX_V1\n";
 const ENTRY_MAGIC: &[u8; 8] = b"SYNIDX1E";
 const BLOOM_BYTES: usize = 256;
 const BLOOM_BITS: u64 = (BLOOM_BYTES * 8) as u64;
-const MAX_INDEX_RECORDS: usize = 16_384;
+pub(super) const MAX_INDEX_RECORDS: usize = 16_384;
 const MAX_INDEX_ENTRIES: usize = 32_768;
 const MAX_INDEX_ENTRY_BYTES: usize = 512;
 
@@ -49,6 +49,52 @@ pub(super) fn is_ready(store: &FileStore) -> Result<bool, StoreError> {
     }
 
     Ok(true)
+}
+
+pub(super) fn validate(store: &FileStore, record_ids: &[String]) -> Result<usize, StoreError> {
+    let directory = index_dir(store);
+    let entries = fs::read_dir(&directory)?;
+    let mut entry_count = 0usize;
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("idx")
+        {
+            continue;
+        }
+        entry_count += 1;
+        if entry_count > MAX_INDEX_ENTRIES {
+            return Err(StoreError::IndexEntryCapacityExceeded {
+                max_entries: MAX_INDEX_ENTRIES,
+            });
+        }
+        read_entry(&entry.path())?;
+    }
+
+    for id in record_ids {
+        let (record, serialized) =
+            store
+                .read_record_with_serialized(id)?
+                .ok_or_else(|| StoreError::CorruptIndex {
+                    reason: format!(
+                        "authoritative record '{id}' disappeared during index validation"
+                    ),
+                })?;
+        let expected = encode_entry(&record)?;
+        let path = directory.join(index_entry_file_name(&serialized));
+        match verify_existing_entry(&path, &expected) {
+            Ok(()) => {}
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::CorruptIndex {
+                    reason: format!("authoritative record '{id}' has no derived index entry"),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(entry_count)
 }
 
 pub(super) fn rebuild(store: &FileStore) -> Result<usize, StoreError> {

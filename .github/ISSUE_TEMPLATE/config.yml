@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Jervis-UMTC/synapse/security/policy
+    about: Read the private vulnerability reporting policy before disclosing security-sensitive details.

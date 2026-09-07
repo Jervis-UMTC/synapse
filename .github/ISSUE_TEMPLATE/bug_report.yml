@@ -1,0 +1,60 @@
+name: Bug report
+description: Report reproducible incorrect Synapse behavior
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not include credentials, private machine data, or exploitable security details here; use SECURITY.md for vulnerabilities.
+  - type: input
+    id: version
+    attributes:
+      label: Synapse version / commit
+      placeholder: "synapse 0.1.0 or git commit SHA"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or API call
+      description: Redact machine-private paths or values when they are not needed to reproduce the bug.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest safe sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Logs or store metadata are useful only when they contain no secrets or unrelated private data.

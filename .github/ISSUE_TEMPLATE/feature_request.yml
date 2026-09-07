@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a focused improvement to local cross-tool knowledge sharing
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete local-tool workflow is difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: reuse
+    attributes:
+      label: Cross-tool reuse
+      description: How would this make knowledge discovered by one local tool safely reusable by another unrelated tool?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest public behavior that would solve the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Could an existing store, IPC, retrieval, or adapter boundary solve this without a new subsystem?
+  - type: textarea
+    id: security
+    attributes:
+      label: Security / compatibility considerations
+      description: Note changes to trust, persistence formats, resource bounds, portability, or backward compatibility.

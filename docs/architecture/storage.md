@@ -124,6 +124,14 @@ synapse knowledge show <id>
 
 Task 8 adds an IPC execution path. After `synapse ipc trust <client-id> <executable-path>` and `synapse ipc serve`, setting `SYNAPSE_IPC=1` routes add/replace/show/find/relate/status through the local service. IPC writes authenticate the peer executable before the same `FileStore` authorization and persistence rules run. See [`ipc.md`](ipc.md).
 
+## Structural inspection
+
+`FileStore::inspect` and the CLI command `synapse doctor` provide a bounded structural health check without repairing or rewriting authoritative knowledge. A missing selected store is reported as uninitialized without creating it. For an existing store, inspection takes the shared state lock, reopens every authoritative record within the 16,384-record bound, loads and validates the full bounded relation graph, validates configured authorization and any existing store identity, and validates the derived index when its readiness marker is present.
+
+Index rebuild takes the exclusive state lock because it mutates derived index state; this prevents queries and diagnostics from observing an in-progress rebuild. Record and relation writes already use the exclusive side of the same lock.
+
+Inspection does not create a store identity, rebuild the index, modify authorization, or rewrite records or relations. On an existing store it may create or use the `.state.lock` coordination file required for the consistent authoritative/index snapshot. Authorization and store identity are independently write-once files; inspection validates the version visible when read rather than treating their absence as corruption. See [`../operations/doctor.md`](../operations/doctor.md) for the operational contract.
+
 ## Deferred work
 
 This file store is a bootstrap persistence mechanism, not the final security or retrieval architecture. Task 4 added bounded lexical discovery, Task 5 a durable derived index, Task 6 append-only conflict/supersession history, Task 7 write authorization, and Task 8 an OS-bound local IPC write-authentication path. See [`retrieval.md`](retrieval.md), [`index.md`](index.md), [`evolution.md`](evolution.md), [`authorization.md`](authorization.md), and [`ipc.md`](ipc.md). Semantic ranking, destructive mutation/deletion, relation retraction, general multi-record/multi-relation transactions beyond the focused atomic successor operation, OS service/account isolation, process-image attestation, embeddings, and synchronization remain deferred.
