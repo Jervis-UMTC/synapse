@@ -102,6 +102,53 @@ fn knowledge_create_emits_a_serialized_record() {
 }
 
 #[test]
+fn knowledge_create_accepts_a_paired_scope_and_key() {
+    let output = synapse(None)
+        .args([
+            "knowledge",
+            "create",
+            "rust-path",
+            "fact",
+            "test-client",
+            "observed",
+            "high",
+            "Rust compiler path",
+            "--scope",
+            "machine",
+            "--key",
+            "toolchain.rust.compiler_path",
+        ])
+        .output()
+        .expect("synapse binary should run");
+    assert!(output.status.success());
+
+    let record: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(record["scope"], "machine");
+    assert_eq!(record["key"], "toolchain.rust.compiler_path");
+}
+
+#[test]
+fn knowledge_create_rejects_an_unpaired_address() {
+    let output = synapse(None)
+        .args([
+            "knowledge",
+            "create",
+            "rust-path",
+            "fact",
+            "test-client",
+            "observed",
+            "high",
+            "Rust compiler path",
+            "--scope",
+            "machine",
+        ])
+        .output()
+        .expect("synapse binary should run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--scope requires --key"));
+}
+
+#[test]
 fn knowledge_create_rejects_unknown_provenance_basis() {
     let output = synapse(None)
         .args([
@@ -218,6 +265,74 @@ fn knowledge_find_discovers_matching_records_without_an_id() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["id"], "rust-toolchain");
     assert_eq!(records[0]["source"], "machine-inspector");
+}
+
+#[test]
+fn knowledge_find_can_use_scope_and_key_without_free_text() {
+    let directory = TestDir::new();
+    for args in [
+        [
+            "knowledge",
+            "add",
+            "machine-rust",
+            "fact",
+            "machine-inspector",
+            "observed",
+            "high",
+            "compiler at machine path",
+            "--scope",
+            "machine",
+            "--key",
+            "toolchain.rust.compiler_path",
+        ],
+        [
+            "knowledge",
+            "add",
+            "project-rust",
+            "fact",
+            "machine-inspector",
+            "observed",
+            "high",
+            "compiler at project path",
+            "--scope",
+            "project:synapse",
+            "--key",
+            "toolchain.rust.compiler_path",
+        ],
+    ] {
+        let output = synapse(Some(directory.path()))
+            .args(args)
+            .output()
+            .expect("addressed writer should run");
+        assert!(
+            output.status.success(),
+            "addressed add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = synapse(Some(directory.path()))
+        .args([
+            "knowledge",
+            "find",
+            "--scope",
+            "machine",
+            "--key",
+            "toolchain.rust.compiler_path",
+        ])
+        .output()
+        .expect("address reader should run");
+    assert!(
+        output.status.success(),
+        "address find failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hits: Value = serde_json::from_slice(&output.stdout).expect("find output should be JSON");
+    let hits = hits.as_array().expect("find output should be an array");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["id"], "machine-rust");
+    assert_eq!(hits[0]["scope"], "machine");
+    assert_eq!(hits[0]["key"], "toolchain.rust.compiler_path");
 }
 
 #[test]
@@ -345,6 +460,71 @@ fn knowledge_relations_change_current_discovery_without_overwriting_history() {
     let shown: Value = serde_json::from_slice(&shown.stdout).expect("show should be JSON");
     assert_eq!(shown["state"], "active");
     assert!(shown.get("effective_state").is_none());
+}
+
+#[test]
+fn knowledge_replace_atomically_publishes_a_successor_and_supersedes_the_old_record() {
+    let directory = TestDir::new();
+    let old = synapse(Some(directory.path()))
+        .args([
+            "knowledge",
+            "add",
+            "compiler-old",
+            "fact",
+            "inspector",
+            "observed",
+            "high",
+            "compiler path C:/old/rustc.exe",
+        ])
+        .output()
+        .expect("old writer should run");
+    assert!(old.status.success());
+
+    let replaced = synapse(Some(directory.path()))
+        .args([
+            "knowledge",
+            "replace",
+            "compiler-new",
+            "fact",
+            "inspector",
+            "observed",
+            "high",
+            "compiler path C:/new/rustc.exe",
+            "compiler-replaced",
+            "compiler-old",
+        ])
+        .output()
+        .expect("atomic replacement should run");
+    assert!(
+        replaced.status.success(),
+        "replace failed: {}",
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    let replacement: Value =
+        serde_json::from_slice(&replaced.stdout).expect("replace output should be JSON");
+    assert_eq!(replacement["record"]["id"], "compiler-new");
+    assert_eq!(replacement["relation"]["id"], "compiler-replaced");
+    assert_eq!(replacement["relation"]["kind"], "supersedes");
+
+    let found = synapse(Some(directory.path()))
+        .args(["knowledge", "find", "compiler path"])
+        .output()
+        .expect("reader should run");
+    assert!(found.status.success());
+    let hits: Value = serde_json::from_slice(&found.stdout).expect("find output should be JSON");
+    let hits = hits.as_array().expect("find output should be an array");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["id"], "compiler-new");
+    assert_eq!(hits[0]["effective_state"], "active");
+
+    let status = synapse(Some(directory.path()))
+        .args(["knowledge", "status", "compiler-old"])
+        .output()
+        .expect("status reader should run");
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status should be JSON");
+    assert_eq!(status["effective_state"], "superseded");
+    assert_eq!(status["superseded_by"][0]["id"], "compiler-replaced");
 }
 
 #[test]
@@ -484,6 +664,113 @@ fn ipc_authenticates_trusted_executable_and_rejects_source_spoofing() {
         1
     );
     assert_eq!(hits[0]["id"], "ipc-record");
+
+    let mut successor_server = one_shot_ipc_server(directory.path());
+    let replaced = synapse(Some(directory.path()))
+        .env("SYNAPSE_IPC", "1")
+        .args([
+            "knowledge",
+            "replace",
+            "ipc-record-2",
+            "fact",
+            "ipc-client",
+            "observed",
+            "high",
+            "authenticated IPC replacement",
+            "ipc-record-replaced",
+            "ipc-record",
+        ])
+        .output()
+        .expect("IPC atomic successor should run");
+    assert!(
+        replaced.status.success(),
+        "authenticated IPC replace failed: {}",
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    assert!(successor_server
+        .wait()
+        .expect("IPC successor server should exit")
+        .success());
+
+    let mut replacement_reader_server = one_shot_ipc_server(directory.path());
+    let current = synapse(Some(directory.path()))
+        .env("SYNAPSE_IPC", "1")
+        .args(["knowledge", "find", "authenticated IPC"])
+        .output()
+        .expect("IPC current reader should run");
+    assert!(current.status.success());
+    assert!(replacement_reader_server
+        .wait()
+        .expect("IPC replacement reader should exit")
+        .success());
+    let current_hits: Value =
+        serde_json::from_slice(&current.stdout).expect("IPC replacement find should emit JSON");
+    let current_hits = current_hits
+        .as_array()
+        .expect("IPC replacement find should return an array");
+    assert_eq!(current_hits.len(), 1);
+    assert_eq!(current_hits[0]["id"], "ipc-record-2");
+
+    let mut addressed_writer_server = one_shot_ipc_server(directory.path());
+    let addressed = synapse(Some(directory.path()))
+        .env("SYNAPSE_IPC", "1")
+        .args([
+            "knowledge",
+            "add",
+            "ipc-addressed",
+            "fact",
+            "ipc-client",
+            "observed",
+            "high",
+            "authenticated addressed knowledge",
+            "--scope",
+            "machine",
+            "--key",
+            "toolchain.rust.compiler_path",
+        ])
+        .output()
+        .expect("addressed IPC writer should run");
+    assert!(
+        addressed.status.success(),
+        "addressed IPC write failed: {}",
+        String::from_utf8_lossy(&addressed.stderr)
+    );
+    assert!(addressed_writer_server
+        .wait()
+        .expect("addressed IPC writer server should exit")
+        .success());
+
+    let mut addressed_reader_server = one_shot_ipc_server(directory.path());
+    let addressed_found = synapse(Some(directory.path()))
+        .env("SYNAPSE_IPC", "1")
+        .args([
+            "knowledge",
+            "find",
+            "--scope",
+            "machine",
+            "--key",
+            "toolchain.rust.compiler_path",
+        ])
+        .output()
+        .expect("addressed IPC reader should run");
+    assert!(
+        addressed_found.status.success(),
+        "addressed IPC read failed: {}",
+        String::from_utf8_lossy(&addressed_found.stderr)
+    );
+    assert!(addressed_reader_server
+        .wait()
+        .expect("addressed IPC reader server should exit")
+        .success());
+    let addressed_hits: Value = serde_json::from_slice(&addressed_found.stdout)
+        .expect("addressed IPC find should emit JSON");
+    let addressed_hits = addressed_hits
+        .as_array()
+        .expect("addressed IPC find should return an array");
+    assert_eq!(addressed_hits.len(), 1);
+    assert_eq!(addressed_hits[0]["id"], "ipc-addressed");
+    assert_eq!(addressed_hits[0]["scope"], "machine");
+    assert_eq!(addressed_hits[0]["key"], "toolchain.rust.compiler_path");
 
     let mut spoof_server = one_shot_ipc_server(directory.path());
     let spoofed = synapse(Some(directory.path()))

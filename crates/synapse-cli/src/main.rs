@@ -42,6 +42,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         return match args.get(1).map(String::as_str) {
             Some("create") => create_knowledge(&args[2..]),
             Some("add") => add_knowledge(&args[2..]),
+            Some("replace") => replace_knowledge(&args[2..]),
             Some("show") => show_knowledge(&args[2..]),
             Some("find") => find_knowledge(&args[2..]),
             Some("relate") => relate_knowledge(&args[2..]),
@@ -126,6 +127,51 @@ fn add_knowledge(args: &[String]) -> Result<(), String> {
     print_record(&record)
 }
 
+fn replace_knowledge(args: &[String]) -> Result<(), String> {
+    if args.len() < 8 {
+        return Err(usage());
+    }
+
+    let record = apply_record_address_options(build_knowledge_record(&args[..6])?, &args[8..])?;
+    let relation = KnowledgeRelation::new(
+        &args[6],
+        &record.id,
+        KnowledgeRelationKind::Supersedes,
+        &args[7],
+        &record.source,
+        current_unix_ms()?,
+        Provenance {
+            basis: record.provenance.basis,
+            detail: None,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+
+    let (record, relation) = if ipc_enabled() {
+        match ipc_call(IpcRequest::InsertSuccessor { record, relation })? {
+            IpcValue::InsertedSuccessor { record, relation } => (record, relation),
+            _ => {
+                return Err(
+                    "Synapse IPC returned an unexpected atomic successor response".to_owned(),
+                )
+            }
+        }
+    } else {
+        FileStore::new(store_root()?)
+            .insert_successor(&record, &relation)
+            .map_err(|error| error.to_string())?;
+        (record, relation)
+    };
+
+    let output = serde_json::json!({ "record": record, "relation": relation });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .map_err(|error| format!("failed to serialize atomic successor: {error}"))?
+    );
+    Ok(())
+}
+
 fn show_knowledge(args: &[String]) -> Result<(), String> {
     if args.len() != 1 {
         return Err(usage());
@@ -147,21 +193,33 @@ fn show_knowledge(args: &[String]) -> Result<(), String> {
 }
 
 fn find_knowledge(args: &[String]) -> Result<(), String> {
-    if args.is_empty() || args[0].trim().is_empty() {
+    if args.is_empty() {
         return Err(usage());
     }
 
-    let mut query = KnowledgeQuery {
-        text: Some(args[0].clone()),
-        ..KnowledgeQuery::default()
-    };
-    let mut index = 1;
+    let mut query = KnowledgeQuery::default();
+    let mut has_constraint = false;
+    let mut index = 0usize;
+    if !args[0].starts_with("--") {
+        if args[0].trim().is_empty() {
+            return Err(usage());
+        }
+        query.text = Some(args[0].clone());
+        has_constraint = true;
+        index = 1;
+    }
+
     while index < args.len() {
         let option = args[index].as_str();
         let value = args.get(index + 1).ok_or_else(usage)?;
+        if value.trim().is_empty() {
+            return Err(format!("find option '{option}' must not be empty"));
+        }
         match option {
             "--kind" => query.kind = Some(value.clone()),
             "--source" => query.source = Some(value.clone()),
+            "--scope" => query.scope = Some(value.clone()),
+            "--key" => query.key = Some(value.clone()),
             "--state" => query.state = parse_query_state(value)?,
             "--basis" => query.provenance_basis = parse_query_basis(value)?,
             "--limit" => {
@@ -171,7 +229,12 @@ fn find_knowledge(args: &[String]) -> Result<(), String> {
             }
             other => return Err(format!("unknown find option '{other}'\n{}", usage())),
         }
+        has_constraint = true;
         index += 2;
+    }
+
+    if !has_constraint {
+        return Err(usage());
     }
 
     let records = if ipc_enabled() {
@@ -303,7 +366,7 @@ fn parse_query_basis(value: &str) -> Result<Option<ProvenanceBasis>, String> {
 }
 
 fn build_knowledge_record(args: &[String]) -> Result<KnowledgeRecord, String> {
-    if args.len() != 6 {
+    if args.len() < 6 {
         return Err(usage());
     }
 
@@ -322,8 +385,7 @@ fn build_knowledge_record(args: &[String]) -> Result<KnowledgeRecord, String> {
     };
 
     let created_at_unix_ms = current_unix_ms()?;
-
-    KnowledgeRecord::new(
+    let record = KnowledgeRecord::new(
         &args[0],
         &args[5],
         &args[1],
@@ -336,7 +398,47 @@ fn build_knowledge_record(args: &[String]) -> Result<KnowledgeRecord, String> {
             detail: None,
         },
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+
+    apply_record_address_options(record, &args[6..])
+}
+
+fn apply_record_address_options(
+    record: KnowledgeRecord,
+    args: &[String],
+) -> Result<KnowledgeRecord, String> {
+    if args.is_empty() {
+        return Ok(record);
+    }
+    if args.len() % 2 != 0 {
+        return Err(usage());
+    }
+
+    let mut scope = None;
+    let mut key = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let value = args.get(index + 1).ok_or_else(usage)?;
+        match option {
+            "--scope" if scope.is_none() => scope = Some(value.clone()),
+            "--key" if key.is_none() => key = Some(value.clone()),
+            "--scope" | "--key" => {
+                return Err(format!("duplicate record address option '{option}'"))
+            }
+            other => return Err(format!("unknown record option '{other}'\n{}", usage())),
+        }
+        index += 2;
+    }
+
+    match (scope, key) {
+        (None, None) => Ok(record),
+        (Some(scope), Some(key)) => record
+            .with_address(scope, key)
+            .map_err(|error| error.to_string()),
+        (Some(_), None) => Err("--scope requires --key".to_owned()),
+        (None, Some(_)) => Err("--key requires --scope".to_owned()),
+    }
 }
 
 fn print_record(record: &KnowledgeRecord) -> Result<(), String> {
@@ -425,10 +527,11 @@ fn usage() -> String {
         "usage: synapse --version | ",
         "synapse authorization init <client-id> | ",
         "synapse ipc serve [--once] | synapse ipc trust <client-id> <executable-path> | synapse ipc ping | ",
-        "synapse knowledge create <id> <kind> <source> <observed|inferred> <unknown|low|medium|high> <content> | ",
-        "synapse knowledge add <id> <kind> <source> <observed|inferred> <unknown|low|medium|high> <content> | ",
+        "synapse knowledge create <id> <kind> <source> <observed|inferred> <unknown|low|medium|high> <content> [--scope <scope> --key <key>] | ",
+        "synapse knowledge add <id> <kind> <source> <observed|inferred> <unknown|low|medium|high> <content> [--scope <scope> --key <key>] | ",
+        "synapse knowledge replace <new-id> <kind> <source> <observed|inferred> <unknown|low|medium|high> <content> <relation-id> <old-id> [--scope <scope> --key <key>] | ",
         "synapse knowledge show <id> | ",
-        "synapse knowledge find <text> [--kind <kind>] [--source <source>] [--state <active|stale|conflicted|superseded|unknown|any>] [--basis <observed|inferred|any>] [--limit <1..10>] | ",
+        "synapse knowledge find [<text>] [--kind <kind>] [--source <source>] [--scope <scope>] [--key <key>] [--state <active|stale|conflicted|superseded|unknown|any>] [--basis <observed|inferred|any>] [--limit <1..10>] | ",
         "synapse knowledge relate <relation-id> <subject-id> <supersedes|conflicts> <object-id> <source> <observed|inferred> | ",
         "synapse knowledge status <id> | ",
         "synapse knowledge index rebuild"
