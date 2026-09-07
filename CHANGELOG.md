@@ -25,4 +25,4 @@ All notable user-visible changes to Synapse will be documented in this file. Syn
 
 ### Fixed
 
-- Normalize OS-reported IPC peer process IDs with checked conversion so authenticated IPC compiles safely on Unix as well as Windows.
+- Normalize OS-reported IPC peer process IDs with checked conversion and use macOS `LOCAL_PEERPID` when the transport credential API omits the PID, preserving executable-bound IPC authentication across Windows, Linux, and macOS.

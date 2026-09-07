@@ -640,11 +640,34 @@ fn require_source(claimed: &str, authenticated: &str) -> Result<(), IpcError> {
 }
 
 fn authenticate_peer(store: &FileStore, stream: &Stream) -> Result<String, IpcError> {
-    let creds = stream.peer_creds()?;
-    let pid = creds.pid().ok_or(IpcError::PeerProcessIdUnavailable)?;
-    let pid = normalize_peer_pid(pid)?;
+    let pid = peer_process_id(stream)?;
     let fingerprint = fingerprint_process(pid)?;
     trusted_client_for_fingerprint(store, &fingerprint)
+}
+
+fn peer_process_id(stream: &Stream) -> Result<u32, IpcError> {
+    let creds = stream.peer_creds()?;
+    if let Some(pid) = creds.pid() {
+        return normalize_peer_pid(pid);
+    }
+
+    fallback_peer_process_id(stream)
+}
+
+#[cfg(target_os = "macos")]
+fn fallback_peer_process_id(stream: &Stream) -> Result<u32, IpcError> {
+    let pid = match stream {
+        Stream::UdSocket(stream) => {
+            nix::sys::socket::getsockopt(stream.inner(), nix::sys::socket::sockopt::LocalPeerPid)
+                .map_err(|error| IpcError::Io(io::Error::from_raw_os_error(error as i32)))?
+        }
+    };
+    normalize_peer_pid(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fallback_peer_process_id(_stream: &Stream) -> Result<u32, IpcError> {
+    Err(IpcError::PeerProcessIdUnavailable)
 }
 
 fn normalize_peer_pid<T>(pid: T) -> Result<u32, IpcError>
@@ -973,6 +996,28 @@ mod tests {
             normalize_peer_pid(-1_i32),
             Err(IpcError::PeerProcessIdUnavailable)
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_local_peer_pid_fallback_reads_the_connected_process() {
+        use interprocess::local_socket::ListenerOptions;
+
+        let name = format!("synapse-macos-peer-pid-test-{}", process::id())
+            .to_ns_name::<GenericNamespaced>()
+            .expect("test endpoint name should be valid");
+        let listener = ListenerOptions::new()
+            .name(name.clone())
+            .create_sync()
+            .expect("listener should bind");
+        let client = Stream::connect(name).expect("client should connect");
+        let server = listener.accept().expect("server should accept");
+
+        assert_eq!(
+            peer_process_id(&server).expect("macOS should expose LOCAL_PEERPID"),
+            process::id()
+        );
+        drop(client);
     }
 
     fn endpoint_test_root(label: &str) -> PathBuf {

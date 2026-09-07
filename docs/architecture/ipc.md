@@ -36,7 +36,7 @@ The IPC layer reuses `synapse-core` and `synapse-store` data contracts rather th
 
 ## Peer identity
 
-Authoritative IPC writes require an OS-reported peer process ID. If the local-socket backend cannot provide a process ID, writes fail closed.
+Authoritative IPC writes require an OS-reported peer process ID. `interprocess` supplies that PID directly on Windows and Linux. On macOS its credential abstraction exposes the peer credentials but omits the PID, so Synapse reads the kernel's `LOCAL_PEERPID` socket option through the safe `nix` wrapper. If neither path yields a valid non-negative process ID, writes fail closed.
 
 For each write the service:
 

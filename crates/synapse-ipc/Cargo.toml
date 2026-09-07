@@ -15,5 +15,8 @@ synapse-core = { path = "../synapse-core" }
 synapse-store = { path = "../synapse-store" }
 sysinfo = "0.33"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["socket"] }
+
 [lints]
 workspace = true
