@@ -9,6 +9,10 @@ pub struct KnowledgeRecord {
     pub content: String,
     pub kind: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub created_at_unix_ms: u64,
     pub confidence: Confidence,
     pub state: KnowledgeState,
@@ -84,6 +88,10 @@ struct UncheckedKnowledgeRecord {
     content: String,
     kind: String,
     source: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
     created_at_unix_ms: u64,
     confidence: Confidence,
     state: KnowledgeState,
@@ -129,7 +137,7 @@ impl TryFrom<UncheckedKnowledgeRecord> for KnowledgeRecord {
     type Error = InvalidKnowledgeRecord;
 
     fn try_from(record: UncheckedKnowledgeRecord) -> Result<Self, Self::Error> {
-        Self::new(
+        let result = Self::new(
             record.id,
             record.content,
             record.kind,
@@ -138,7 +146,13 @@ impl TryFrom<UncheckedKnowledgeRecord> for KnowledgeRecord {
             record.confidence,
             record.state,
             record.provenance,
-        )
+        )?;
+        match (record.scope, record.key) {
+            (None, None) => Ok(result),
+            (Some(scope), Some(key)) => result.with_address(scope, key),
+            (None, Some(_)) => Err(InvalidKnowledgeRecord { field: "scope" }),
+            (Some(_), None) => Err(InvalidKnowledgeRecord { field: "key" }),
+        }
     }
 }
 
@@ -221,6 +235,8 @@ impl KnowledgeRecord {
             content: content.into(),
             kind: kind.into(),
             source: source.into(),
+            scope: None,
+            key: None,
             created_at_unix_ms,
             confidence,
             state,
@@ -239,6 +255,25 @@ impl KnowledgeRecord {
         }
 
         Ok(record)
+    }
+
+    /// Attach a stable logical address used by unrelated tools to refer to the same fact.
+    pub fn with_address(
+        mut self,
+        scope: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Result<Self, InvalidKnowledgeRecord> {
+        let scope = scope.into();
+        if scope.trim().is_empty() {
+            return Err(InvalidKnowledgeRecord { field: "scope" });
+        }
+        let key = key.into();
+        if key.trim().is_empty() {
+            return Err(InvalidKnowledgeRecord { field: "key" });
+        }
+        self.scope = Some(scope);
+        self.key = Some(key);
+        Ok(self)
     }
 }
 
@@ -273,6 +308,63 @@ mod tests {
         assert_eq!(record.confidence, Confidence::High);
         assert_eq!(record.state, KnowledgeState::Active);
         assert_eq!(record.provenance.basis, ProvenanceBasis::Observed);
+    }
+
+    #[test]
+    fn stable_address_round_trips_as_a_paired_scope_and_key() {
+        let record = observed_record()
+            .with_address("machine", "toolchain.rust.compiler_path")
+            .expect("address should be valid");
+
+        let json = serde_json::to_string(&record).expect("addressed record should serialize");
+        let decoded: KnowledgeRecord =
+            serde_json::from_str(&json).expect("addressed record should deserialize");
+
+        assert_eq!(decoded.scope.as_deref(), Some("machine"));
+        assert_eq!(decoded.key.as_deref(), Some("toolchain.rust.compiler_path"));
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn legacy_records_without_an_address_remain_valid() {
+        let json = r#"{
+            "id":"legacy",
+            "content":"legacy knowledge",
+            "kind":"fact",
+            "source":"legacy-writer",
+            "created_at_unix_ms":1,
+            "confidence":"high",
+            "state":"active",
+            "provenance":{"basis":"observed","detail":null}
+        }"#;
+
+        let record: KnowledgeRecord =
+            serde_json::from_str(json).expect("legacy record should still deserialize");
+        assert_eq!(record.scope, None);
+        assert_eq!(record.key, None);
+    }
+
+    #[test]
+    fn address_fields_must_be_present_together_and_non_empty() {
+        let missing_key = r#"{
+            "id":"bad",
+            "content":"knowledge",
+            "kind":"fact",
+            "source":"writer",
+            "scope":"machine",
+            "created_at_unix_ms":1,
+            "confidence":"high",
+            "state":"active",
+            "provenance":{"basis":"observed","detail":null}
+        }"#;
+        let error = serde_json::from_str::<KnowledgeRecord>(missing_key)
+            .expect_err("scope without key must be rejected");
+        assert!(error.to_string().contains("field 'key' must not be empty"));
+
+        let error = observed_record()
+            .with_address("machine", "   ")
+            .expect_err("empty key must be rejected");
+        assert_eq!(error, InvalidKnowledgeRecord { field: "key" });
     }
 
     #[test]
