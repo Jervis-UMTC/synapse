@@ -2,7 +2,11 @@
 
 mod authorization;
 mod evolution;
+mod format;
+mod identity;
 mod index;
+mod state_lock;
+mod successor;
 
 pub use authorization::{AuthorizationPolicy, ClientAuthorization, InvalidAuthorizationPolicy};
 
@@ -27,6 +31,7 @@ const MAX_ID_BYTES: usize = 100;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_QUERY_RESULTS: usize = 10;
 const MAX_QUERY_TEXT_BYTES: usize = 256;
+const MAX_QUERY_ADDRESS_BYTES: usize = 256;
 const MAX_QUERY_SCAN_RECORDS: usize = 256;
 const MAX_QUERY_CANDIDATES: usize = 256;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +48,8 @@ pub struct KnowledgeQuery {
     pub text: Option<String>,
     pub kind: Option<String>,
     pub source: Option<String>,
+    pub scope: Option<String>,
+    pub key: Option<String>,
     pub state: Option<KnowledgeState>,
     pub provenance_basis: Option<ProvenanceBasis>,
     pub limit: usize,
@@ -54,6 +61,8 @@ impl Default for KnowledgeQuery {
             text: None,
             kind: None,
             source: None,
+            scope: None,
+            key: None,
             state: Some(KnowledgeState::Active),
             provenance_basis: None,
             limit: 5,
@@ -102,10 +111,30 @@ pub enum StoreError {
     RecordTooLarge {
         max_bytes: usize,
     },
+    SuccessorTooLarge {
+        max_bytes: usize,
+    },
+    InvalidSuccessor {
+        reason: String,
+    },
+    CorruptSuccessor {
+        id: String,
+        reason: String,
+    },
+    StoreIdentityTooLarge {
+        max_bytes: usize,
+    },
+    InvalidStoreIdentity {
+        reason: String,
+    },
     InvalidQueryLimit {
         max: usize,
     },
     QueryTextTooLong {
+        max_bytes: usize,
+    },
+    QueryAddressTooLong {
+        field: &'static str,
         max_bytes: usize,
     },
     QueryScanLimitExceeded {
@@ -179,6 +208,24 @@ impl fmt::Display for StoreError {
                 formatter,
                 "knowledge record exceeds the storage limit of {max_bytes} bytes"
             ),
+            Self::SuccessorTooLarge { max_bytes } => write!(
+                formatter,
+                "atomic successor commit exceeds the storage limit of {max_bytes} bytes"
+            ),
+            Self::InvalidSuccessor { reason } => {
+                write!(formatter, "invalid atomic successor: {reason}")
+            }
+            Self::CorruptSuccessor { id, reason } => write!(
+                formatter,
+                "stored atomic successor for record '{id}' is invalid: {reason}"
+            ),
+            Self::StoreIdentityTooLarge { max_bytes } => write!(
+                formatter,
+                "Synapse store identity exceeds the limit of {max_bytes} bytes"
+            ),
+            Self::InvalidStoreIdentity { reason } => {
+                write!(formatter, "Synapse store identity is invalid: {reason}")
+            }
             Self::InvalidQueryLimit { max } => write!(
                 formatter,
                 "knowledge query limit must be between 1 and {max}"
@@ -186,6 +233,10 @@ impl fmt::Display for StoreError {
             Self::QueryTextTooLong { max_bytes } => write!(
                 formatter,
                 "knowledge query text exceeds the limit of {max_bytes} bytes"
+            ),
+            Self::QueryAddressTooLong { field, max_bytes } => write!(
+                formatter,
+                "knowledge query {field} exceeds the limit of {max_bytes} bytes"
             ),
             Self::QueryScanLimitExceeded { max_records } => write!(
                 formatter,
@@ -286,6 +337,11 @@ impl FileStore {
         &self.root
     }
 
+    /// Read the durable store identifier, creating it once when absent.
+    pub fn store_id(&self) -> Result<String, StoreError> {
+        identity::load_or_initialize(self)
+    }
+
     /// Persist a record exactly once. Existing IDs are never overwritten.
     pub fn insert(&self, record: &KnowledgeRecord) -> Result<(), StoreError> {
         authorization::require(
@@ -293,23 +349,27 @@ impl FileStore {
             &record.source,
             authorization::AuthorizationCapability::WriteRecords,
         )?;
+        let _state_lock = state_lock::exclusive(self)?;
         let file_name = record_file_name(&record.id)?;
-        let serialized = serde_json::to_vec(record).map_err(|error| StoreError::CorruptRecord {
-            id: record.id.clone(),
-            reason: error.to_string(),
-        })?;
+        let serialized = format::serialize_record(record)?;
         if serialized.len() > MAX_RECORD_BYTES {
             return Err(StoreError::RecordTooLarge {
                 max_bytes: MAX_RECORD_BYTES,
             });
         }
 
+        let records_dir = self.records_dir();
+        let final_path = records_dir.join(file_name);
+        if self.read_record_with_serialized(&record.id)?.is_some() {
+            return Err(StoreError::AlreadyExists {
+                id: record.id.clone(),
+            });
+        }
+
         index::ensure_ready(self)?;
         index::publish_record_entry(self, record, &serialized)?;
 
-        let records_dir = self.records_dir();
         create_private_dir_all(&records_dir)?;
-        let final_path = records_dir.join(file_name);
         let (temporary_path, mut temporary_file) = create_temporary_file(&records_dir)?;
 
         let write_result = (|| -> Result<(), StoreError> {
@@ -320,6 +380,7 @@ impl FileStore {
             match fs::hard_link(&temporary_path, &final_path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    index::reconcile_duplicate_record_entry(self, record, &serialized)?;
                     Err(StoreError::AlreadyExists {
                         id: record.id.clone(),
                     })
@@ -334,6 +395,33 @@ impl FileStore {
 
     /// Read one record by ID. Missing IDs return `Ok(None)`.
     pub fn get(&self, id: &str) -> Result<Option<KnowledgeRecord>, StoreError> {
+        Ok(self
+            .read_record_with_serialized(id)?
+            .map(|(record, _serialized)| record))
+    }
+
+    pub(crate) fn read_record_with_serialized(
+        &self,
+        id: &str,
+    ) -> Result<Option<(KnowledgeRecord, Vec<u8>)>, StoreError> {
+        let standalone = self.read_standalone_record_with_serialized(id)?;
+        let successor = successor::read(self, id)?;
+        match (standalone, successor) {
+            (Some(_), Some(_)) => Err(StoreError::CorruptRecord {
+                id: id.to_owned(),
+                reason: "record id exists in both standalone and atomic-successor storage"
+                    .to_owned(),
+            }),
+            (Some(record), None) => Ok(Some(record)),
+            (None, Some((commit, serialized))) => Ok(Some((commit.record, serialized))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn read_standalone_record_with_serialized(
+        &self,
+        id: &str,
+    ) -> Result<Option<(KnowledgeRecord, Vec<u8>)>, StoreError> {
         let file_name = record_file_name(id)?;
         let path = self.records_dir().join(file_name);
         let file = match File::open(&path) {
@@ -357,11 +445,7 @@ impl FileStore {
             });
         }
 
-        let record: KnowledgeRecord =
-            serde_json::from_slice(&serialized).map_err(|error| StoreError::CorruptRecord {
-                id: id.to_owned(),
-                reason: error.to_string(),
-            })?;
+        let record = format::deserialize_record(id, &serialized)?;
         if record.id != id {
             return Err(StoreError::CorruptRecord {
                 id: id.to_owned(),
@@ -369,7 +453,7 @@ impl FileStore {
             });
         }
 
-        Ok(Some(record))
+        Ok(Some((record, serialized)))
     }
 
     /// Persist one append-only lifecycle relation after validating both record endpoints.
@@ -379,7 +463,29 @@ impl FileStore {
             &relation.source,
             authorization::AuthorizationCapability::WriteRelations,
         )?;
+        let _state_lock = state_lock::exclusive(self)?;
         evolution::insert_relation(self, relation)
+    }
+
+    /// Atomically publish a new record together with the supersession relation it asserts.
+    pub fn insert_successor(
+        &self,
+        record: &KnowledgeRecord,
+        relation: &KnowledgeRelation,
+    ) -> Result<(), StoreError> {
+        successor::validate_shape(record, relation)?;
+        authorization::require(
+            self,
+            &record.source,
+            authorization::AuthorizationCapability::WriteRecords,
+        )?;
+        authorization::require(
+            self,
+            &relation.source,
+            authorization::AuthorizationCapability::WriteRelations,
+        )?;
+        let _state_lock = state_lock::exclusive(self)?;
+        successor::insert(self, record, relation)
     }
 
     /// Create the store-local authorization policy exactly once.
@@ -394,6 +500,7 @@ impl FileStore {
 
     /// Resolve one record's effective lifecycle state and relation evidence.
     pub fn status(&self, id: &str) -> Result<Option<KnowledgeStatus>, StoreError> {
+        let _state_lock = state_lock::shared(self)?;
         let Some(record) = self.get(id)? else {
             return Ok(None);
         };
@@ -404,6 +511,7 @@ impl FileStore {
     /// Discover persisted knowledge using bounded lexical matching and effective lifecycle state.
     pub fn query(&self, query: &KnowledgeQuery) -> Result<Vec<KnowledgeHit>, StoreError> {
         validate_query(query)?;
+        let _state_lock = state_lock::shared(self)?;
         let normalized_text = query.text.as_ref().map(|text| text.to_lowercase());
         let graph = evolution::RelationGraph::load(self)?;
 
@@ -417,6 +525,7 @@ impl FileStore {
 
     /// Build the durable derived retrieval index for an existing file store.
     pub fn rebuild_index(&self) -> Result<usize, StoreError> {
+        let _state_lock = state_lock::shared(self)?;
         index::rebuild(self)
     }
 
@@ -453,31 +562,42 @@ impl FileStore {
         normalized_text: Option<&str>,
         graph: &evolution::RelationGraph,
     ) -> Result<Vec<KnowledgeHit>, StoreError> {
-        let records_dir = self.records_dir();
-        let entries = match fs::read_dir(&records_dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(StoreError::Io(error)),
-        };
-
+        let mut ids = Vec::new();
         let mut scanned_records = 0usize;
-        let mut matches = Vec::with_capacity(query.limit);
-        for entry in entries {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
+        match fs::read_dir(self.records_dir()) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let Some(id) = record_id_from_file_name(&entry.file_name()) else {
+                        continue;
+                    };
+                    scanned_records += 1;
+                    if scanned_records > MAX_QUERY_SCAN_RECORDS {
+                        return Err(StoreError::IndexRebuildRequired {
+                            legacy_scan_limit: MAX_QUERY_SCAN_RECORDS,
+                        });
+                    }
+                    ids.push(id);
+                }
             }
-            let Some(id) = record_id_from_file_name(&entry.file_name()) else {
-                continue;
-            };
-
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+        for id in successor::record_ids(self)? {
             scanned_records += 1;
             if scanned_records > MAX_QUERY_SCAN_RECORDS {
                 return Err(StoreError::IndexRebuildRequired {
                     legacy_scan_limit: MAX_QUERY_SCAN_RECORDS,
                 });
             }
+            ids.push(id);
+        }
 
+        let mut matches = Vec::with_capacity(query.limit);
+        for id in ids {
             let Some(record) = self.get(&id)? else {
                 continue;
             };
@@ -496,12 +616,45 @@ impl FileStore {
         Ok(matches)
     }
 
+    pub(crate) fn record_storage_exists(&self, id: &str) -> Result<bool, StoreError> {
+        let file_name = record_file_name(id)?;
+        let standalone = storage_path_is_file(&self.records_dir().join(&file_name), id)?;
+        let successor = storage_path_is_file(&self.successors_dir().join(file_name), id)?;
+        if standalone && successor {
+            return Err(StoreError::CorruptRecord {
+                id: id.to_owned(),
+                reason: "record id exists in both standalone and atomic-successor storage"
+                    .to_owned(),
+            });
+        }
+        Ok(standalone || successor)
+    }
+
     fn records_dir(&self) -> PathBuf {
         self.root.join("records")
     }
 
     fn relations_dir(&self) -> PathBuf {
         self.root.join("relations")
+    }
+
+    fn successors_dir(&self) -> PathBuf {
+        self.root.join(successor::SUCCESSOR_DIRECTORY)
+    }
+}
+
+fn storage_path_is_file(path: &Path, id: &str) -> Result<bool, StoreError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(StoreError::CorruptRecord {
+            id: id.to_owned(),
+            reason: format!(
+                "authoritative record path '{}' is not a file",
+                path.display()
+            ),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StoreError::Io(error)),
     }
 }
 
@@ -534,6 +687,14 @@ fn validate_query(query: &KnowledgeQuery) -> Result<(), StoreError> {
             max_bytes: MAX_QUERY_TEXT_BYTES,
         });
     }
+    for (field, value) in [("scope", query.scope.as_ref()), ("key", query.key.as_ref())] {
+        if value.is_some_and(|value| value.len() > MAX_QUERY_ADDRESS_BYTES) {
+            return Err(StoreError::QueryAddressTooLong {
+                field,
+                max_bytes: MAX_QUERY_ADDRESS_BYTES,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -550,6 +711,20 @@ fn record_matches_query(
         .source
         .as_ref()
         .is_some_and(|source| &record.source != source)
+    {
+        return false;
+    }
+    if query
+        .scope
+        .as_ref()
+        .is_some_and(|scope| record.scope.as_ref() != Some(scope))
+    {
+        return false;
+    }
+    if query
+        .key
+        .as_ref()
+        .is_some_and(|key| record.key.as_ref() != Some(key))
     {
         return false;
     }
@@ -575,6 +750,14 @@ fn record_contains_text(record: &KnowledgeRecord, normalized_text: &str) -> bool
     ]
     .into_iter()
     .any(|value| value.to_lowercase().contains(normalized_text))
+        || record
+            .scope
+            .as_deref()
+            .is_some_and(|scope| scope.to_lowercase().contains(normalized_text))
+        || record
+            .key
+            .as_deref()
+            .is_some_and(|key| key.to_lowercase().contains(normalized_text))
         || record
             .provenance
             .detail

@@ -1,10 +1,17 @@
 use std::{
     fs,
+    fs::OpenOptions,
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Barrier,
+    },
+    thread,
+    time::Duration,
 };
 
+use fs2::FileExt;
 use synapse_core::knowledge::{
     Confidence, KnowledgeRecord, KnowledgeRelation, KnowledgeRelationKind, KnowledgeState,
     Provenance, ProvenanceBasis,
@@ -94,6 +101,14 @@ fn relation_path(root: &Path, id: &str) -> PathBuf {
     encoded_path(root, "relations", id)
 }
 
+fn index_entry_count(root: &Path) -> usize {
+    fs::read_dir(root.join("index-v1"))
+        .expect("index directory should exist")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("idx"))
+        .count()
+}
+
 fn record(id: &str, content: &str) -> KnowledgeRecord {
     record_with(
         id,
@@ -103,6 +118,12 @@ fn record(id: &str, content: &str) -> KnowledgeRecord {
         1_788_707_200_000,
         KnowledgeState::Active,
     )
+}
+
+fn addressed_record(id: &str, content: &str, scope: &str, key: &str) -> KnowledgeRecord {
+    record(id, content)
+        .with_address(scope, key)
+        .expect("addressed fixture should be valid")
 }
 
 fn relation(
@@ -161,6 +182,489 @@ fn record_with(
 }
 
 #[test]
+fn store_identity_is_created_once_and_persisted() {
+    let directory = TestDir::unconfigured();
+    let store = FileStore::new(directory.path());
+
+    let first = store.store_id().expect("store identity should initialize");
+    let second = store.store_id().expect("store identity should reload");
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 64);
+    assert!(first
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.path().join("store-identity-v1.json"))
+            .expect("store identity file should exist"),
+    )
+    .expect("store identity should be JSON");
+    assert_eq!(persisted["version"], 1);
+    assert_eq!(persisted["id"], first);
+}
+
+#[test]
+fn concurrent_store_identity_initializers_converge_on_one_id() {
+    let directory = TestDir::unconfigured();
+    let writers = 16usize;
+    let barrier = Arc::new(Barrier::new(writers));
+    let mut handles = Vec::with_capacity(writers);
+
+    for writer in 0..writers {
+        let root = if writer % 2 == 0 {
+            directory.path().to_path_buf()
+        } else {
+            directory.path().join(".")
+        };
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            FileStore::new(root)
+                .store_id()
+                .expect("concurrent store identity initialization should succeed")
+        }));
+    }
+
+    let mut identities = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("identity thread should not panic"))
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    assert_eq!(identities.len(), 1);
+}
+
+#[test]
+fn malformed_store_identity_fails_closed() {
+    let directory = TestDir::unconfigured();
+    fs::write(
+        directory.path().join("store-identity-v1.json"),
+        br#"{"version":1,"id":"not-a-valid-store-id"}"#,
+    )
+    .expect("invalid identity fixture should be written");
+
+    let error = FileStore::new(directory.path())
+        .store_id()
+        .expect_err("invalid store identity must fail closed");
+    assert!(matches!(
+        error,
+        StoreError::InvalidStoreIdentity { ref reason }
+            if reason.contains("64 lowercase hexadecimal")
+    ));
+}
+
+#[test]
+fn future_store_identity_versions_fail_closed() {
+    let directory = TestDir::unconfigured();
+    fs::write(
+        directory.path().join("store-identity-v1.json"),
+        br#"{"version":2,"id":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+    )
+    .expect("future identity fixture should be written");
+
+    let error = FileStore::new(directory.path())
+        .store_id()
+        .expect_err("unsupported identity version must fail closed");
+    assert!(matches!(
+        error,
+        StoreError::InvalidStoreIdentity { ref reason }
+            if reason.contains("unsupported store identity version 2")
+    ));
+}
+
+#[test]
+fn successor_commit_publishes_record_and_supersession_as_one_authoritative_file() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    let old = record_with(
+        "compiler-old",
+        "compiler path old",
+        "fact",
+        "store-test",
+        1_788_707_200_000,
+        KnowledgeState::Active,
+    );
+    store.insert(&old).expect("old record should persist");
+
+    let new = record_with(
+        "compiler-new",
+        "compiler path new",
+        "fact",
+        "store-test",
+        1_788_707_300_000,
+        KnowledgeState::Active,
+    );
+    let supersedes = relation_with_source(
+        "compiler-replaced",
+        "compiler-new",
+        KnowledgeRelationKind::Supersedes,
+        "compiler-old",
+        "store-test",
+    );
+
+    store
+        .insert_successor(&new, &supersedes)
+        .expect("successor commit should persist atomically");
+
+    assert!(
+        !record_path(directory.path(), "compiler-new").exists(),
+        "atomic successors must not publish a standalone record file"
+    );
+    assert!(
+        !relation_path(directory.path(), "compiler-replaced").exists(),
+        "atomic successors must not publish a standalone relation file"
+    );
+    let commit_path = encoded_path(directory.path(), "successors-v1", "compiler-new");
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &fs::read(&commit_path).expect("combined successor commit should exist"),
+    )
+    .expect("combined successor commit should be JSON");
+    assert_eq!(persisted["schema_version"], 1);
+    assert_eq!(persisted["record"]["id"], "compiler-new");
+    assert_eq!(persisted["relation"]["id"], "compiler-replaced");
+    assert_eq!(persisted["relation"]["kind"], "supersedes");
+
+    assert_eq!(
+        store
+            .get("compiler-new")
+            .expect("successor should be readable")
+            .expect("successor should exist"),
+        new
+    );
+    let old_status = store
+        .status("compiler-old")
+        .expect("status should resolve")
+        .expect("old record should exist");
+    assert_eq!(old_status.effective_state, KnowledgeState::Superseded);
+    assert_eq!(old_status.superseded_by.len(), 1);
+    assert_eq!(old_status.superseded_by[0].id, "compiler-replaced");
+
+    let current = store
+        .query(&KnowledgeQuery {
+            text: Some("compiler path".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("current query should resolve the atomic successor");
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].id, "compiler-new");
+    assert_eq!(current[0].effective_state, KnowledgeState::Active);
+}
+
+#[test]
+fn addressed_successor_uses_schema_two_and_keeps_the_same_logical_address_current() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    let old = addressed_record(
+        "address-old",
+        "compiler path old",
+        "machine",
+        "toolchain.rust.compiler_path",
+    );
+    store
+        .insert(&old)
+        .expect("old addressed record should persist");
+
+    let new = addressed_record(
+        "address-new",
+        "compiler path new",
+        "machine",
+        "toolchain.rust.compiler_path",
+    );
+    let relation = relation_with_source(
+        "address-replaced",
+        "address-new",
+        KnowledgeRelationKind::Supersedes,
+        "address-old",
+        "store-test",
+    );
+    store
+        .insert_successor(&new, &relation)
+        .expect("addressed successor should publish");
+
+    let commit: serde_json::Value = serde_json::from_slice(
+        &fs::read(encoded_path(
+            directory.path(),
+            "successors-v1",
+            "address-new",
+        ))
+        .expect("addressed successor commit should be readable"),
+    )
+    .expect("addressed successor commit should be JSON");
+    assert_eq!(commit["schema_version"], 2);
+
+    let current = store
+        .query(&KnowledgeQuery {
+            scope: Some("machine".to_owned()),
+            key: Some("toolchain.rust.compiler_path".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("address query should resolve lifecycle state");
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].id, "address-new");
+    assert_eq!(current[0].effective_state, KnowledgeState::Active);
+}
+
+#[test]
+fn invalid_successor_shape_fails_before_authoritative_or_index_side_effects() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("old", "old value"))
+        .expect("old record should persist");
+    let entries_before = index_entry_count(directory.path());
+    let new = record("new", "new value");
+    let invalid = relation_with_source(
+        "invalid-successor",
+        "old",
+        KnowledgeRelationKind::Supersedes,
+        "new",
+        "store-test",
+    );
+
+    let error = store
+        .insert_successor(&new, &invalid)
+        .expect_err("relation subject must be the new record");
+    assert!(matches!(
+        error,
+        StoreError::InvalidSuccessor { ref reason }
+            if reason.contains("relation subject")
+    ));
+    assert!(!encoded_path(directory.path(), "successors-v1", "new").exists());
+    assert_eq!(index_entry_count(directory.path()), entries_before);
+    assert!(store
+        .get("new")
+        .expect("new id should be readable")
+        .is_none());
+}
+
+#[test]
+fn successor_commit_participates_in_index_rebuild_and_legacy_discovery() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("old", "shared migration value old"))
+        .expect("old record should persist");
+    let new = record_with(
+        "new",
+        "shared migration value new",
+        "fact",
+        "store-test",
+        1_788_707_300_000,
+        KnowledgeState::Active,
+    );
+    let relation = relation_with_source(
+        "new-supersedes-old",
+        "new",
+        KnowledgeRelationKind::Supersedes,
+        "old",
+        "store-test",
+    );
+    store
+        .insert_successor(&new, &relation)
+        .expect("successor should persist");
+
+    fs::remove_dir_all(directory.path().join("index-v1"))
+        .expect("derived index should be removable");
+    let legacy_hits = FileStore::new(directory.path())
+        .query(&KnowledgeQuery {
+            text: Some("shared migration value".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("legacy discovery should enumerate combined successors");
+    assert_eq!(legacy_hits.len(), 1);
+    assert_eq!(legacy_hits[0].id, "new");
+
+    assert_eq!(
+        FileStore::new(directory.path())
+            .rebuild_index()
+            .expect("rebuild should include standalone and successor records"),
+        2
+    );
+    let indexed_hits = FileStore::new(directory.path())
+        .query(&KnowledgeQuery {
+            text: Some("shared migration value".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("indexed discovery should include the successor record");
+    assert_eq!(indexed_hits.len(), 1);
+    assert_eq!(indexed_hits[0].id, "new");
+}
+
+#[test]
+fn successor_ids_share_record_and_relation_uniqueness_with_standalone_storage() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    for id in ["old", "other"] {
+        store
+            .insert(&record(id, &format!("record {id}")))
+            .expect("fixture record should persist");
+    }
+    let new = record("new", "new value");
+    let relation = relation_with_source(
+        "successor-relation",
+        "new",
+        KnowledgeRelationKind::Supersedes,
+        "old",
+        "store-test",
+    );
+    store
+        .insert_successor(&new, &relation)
+        .expect("successor should persist");
+
+    let duplicate_record = store
+        .insert(&record("new", "standalone duplicate"))
+        .expect_err("standalone records must share successor record IDs");
+    assert!(matches!(duplicate_record, StoreError::AlreadyExists { .. }));
+
+    let duplicate_relation = relation_with_source(
+        "successor-relation",
+        "other",
+        KnowledgeRelationKind::ConflictsWith,
+        "old",
+        "store-test",
+    );
+    let error = store
+        .insert_relation(&duplicate_relation)
+        .expect_err("standalone relations must share successor relation IDs");
+    assert!(matches!(error, StoreError::RelationAlreadyExists { .. }));
+}
+
+#[test]
+fn future_successor_schema_versions_fail_closed() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("old", "old value"))
+        .expect("old record should persist");
+    let successors = directory.path().join("successors-v1");
+    fs::create_dir_all(&successors).expect("successor directory should exist");
+    let future = serde_json::json!({
+        "schema_version": 3,
+        "record": record("future", "future value"),
+        "relation": relation_with_source(
+            "future-over-old",
+            "future",
+            KnowledgeRelationKind::Supersedes,
+            "old",
+            "store-test",
+        )
+    });
+    fs::write(
+        encoded_path(directory.path(), "successors-v1", "future"),
+        serde_json::to_vec(&future).expect("future successor fixture should serialize"),
+    )
+    .expect("future successor fixture should be written");
+
+    let error = store
+        .get("future")
+        .expect_err("unsupported successor schema versions must fail closed");
+    assert!(matches!(
+        error,
+        StoreError::CorruptSuccessor { ref reason, .. }
+            if reason.contains("unsupported successor schema version 3")
+    ));
+}
+
+#[test]
+fn incomplete_successor_temp_files_never_become_authoritative() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("old", "stable old value"))
+        .expect("old record should persist");
+    let successors = directory.path().join("successors-v1");
+    fs::create_dir_all(&successors).expect("successor directory should exist");
+    fs::write(
+        successors.join(".synapse-tmp-crash-fixture"),
+        b"partial-json",
+    )
+    .expect("crash temp fixture should be written");
+
+    assert!(store
+        .get("not-published")
+        .expect("missing successor should remain a normal miss")
+        .is_none());
+    let hits = store
+        .query(&KnowledgeQuery {
+            text: Some("stable old value".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("temporary successor files must be ignored by discovery");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "old");
+    assert_eq!(hits[0].effective_state, KnowledgeState::Active);
+}
+
+#[test]
+fn successor_components_keep_the_existing_record_size_limit() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("old", "old value"))
+        .expect("old record should persist");
+    let oversized = record("oversized-successor", &"x".repeat(1024 * 1024));
+    let relation = relation_with_source(
+        "oversized-over-old",
+        "oversized-successor",
+        KnowledgeRelationKind::Supersedes,
+        "old",
+        "store-test",
+    );
+
+    let error = store
+        .insert_successor(&oversized, &relation)
+        .expect_err("successor records must retain the standalone record size bound");
+    assert!(matches!(
+        error,
+        StoreError::RecordTooLarge {
+            max_bytes: 1_048_576
+        }
+    ));
+    assert!(!encoded_path(directory.path(), "successors-v1", "oversized-successor").exists());
+}
+
+#[test]
+fn query_waits_for_the_store_state_lock_before_reading_currentness() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("stable", "stable current value"))
+        .expect("fixture record should persist");
+
+    let state_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.path().join(".state.lock"))
+        .expect("state lock file should exist after a write");
+    FileExt::lock_exclusive(&state_file).expect("test should hold the exclusive state lock");
+
+    let (sender, receiver) = mpsc::channel();
+    let root = directory.path().to_path_buf();
+    let reader = thread::spawn(move || {
+        let result = FileStore::new(root).query(&KnowledgeQuery {
+            text: Some("stable current value".to_owned()),
+            ..KnowledgeQuery::default()
+        });
+        sender.send(result).expect("reader result should be sent");
+    });
+
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        receiver.try_recv().is_err(),
+        "currentness reads must not pass an exclusive state mutation lock"
+    );
+    FileExt::unlock(&state_file).expect("test state lock should release");
+
+    let hits = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("reader should finish after the state lock releases")
+        .expect("query should succeed");
+    reader.join().expect("reader thread should not panic");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "stable");
+}
+
+#[test]
 fn separate_store_instances_can_exchange_a_record() {
     let directory = TestDir::new();
     let writer = FileStore::new(directory.path());
@@ -176,6 +680,103 @@ fn separate_store_instances_can_exchange_a_record() {
 
     assert_eq!(loaded.content, "shared knowledge");
     assert_eq!(loaded.source, "store-test");
+}
+
+#[test]
+fn new_record_files_include_an_explicit_schema_version() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("versioned-record", "versioned payload"))
+        .expect("record should persist");
+
+    let stored: serde_json::Value = serde_json::from_slice(
+        &fs::read(record_path(directory.path(), "versioned-record"))
+            .expect("record file should be readable"),
+    )
+    .expect("record file should contain JSON");
+    assert_eq!(stored["schema_version"], 1);
+    assert_eq!(stored["record"]["id"], "versioned-record");
+    assert_eq!(stored["record"]["content"], "versioned payload");
+}
+
+#[test]
+fn addressed_record_files_use_schema_version_two() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&addressed_record(
+            "addressed-versioned",
+            "addressed payload",
+            "machine",
+            "toolchain.rust.compiler_path",
+        ))
+        .expect("addressed record should persist");
+
+    let stored: serde_json::Value = serde_json::from_slice(
+        &fs::read(record_path(directory.path(), "addressed-versioned"))
+            .expect("addressed record file should be readable"),
+    )
+    .expect("addressed record file should contain JSON");
+    assert_eq!(stored["schema_version"], 2);
+    assert_eq!(stored["record"]["scope"], "machine");
+    assert_eq!(stored["record"]["key"], "toolchain.rust.compiler_path");
+}
+
+#[test]
+fn schema_one_records_cannot_smuggle_scope_key_fields() {
+    let directory = TestDir::new();
+    let records_dir = directory.path().join("records");
+    fs::create_dir_all(&records_dir).expect("records directory should exist");
+    let addressed = addressed_record(
+        "bad-v1-address",
+        "addressed payload",
+        "machine",
+        "toolchain.rust.compiler_path",
+    );
+    let fixture = serde_json::json!({
+        "schema_version": 1,
+        "record": addressed
+    });
+    fs::write(
+        record_path(directory.path(), "bad-v1-address"),
+        serde_json::to_vec(&fixture).expect("fixture should serialize"),
+    )
+    .expect("fixture should be written");
+
+    let error = FileStore::new(directory.path())
+        .get("bad-v1-address")
+        .expect_err("v1 must not accept scope/key fields");
+    assert!(matches!(
+        error,
+        StoreError::CorruptRecord { ref reason, .. }
+            if reason.contains("schema version 1 records cannot contain scope/key")
+    ));
+}
+
+#[test]
+fn explicit_future_record_schema_versions_fail_closed() {
+    let directory = TestDir::new();
+    let records_dir = directory.path().join("records");
+    fs::create_dir_all(&records_dir).expect("records directory should exist");
+    let future = serde_json::json!({
+        "schema_version": 3,
+        "record": record("future-record", "future payload")
+    });
+    fs::write(
+        record_path(directory.path(), "future-record"),
+        serde_json::to_vec(&future).expect("future fixture should serialize"),
+    )
+    .expect("future fixture should be written");
+
+    let error = FileStore::new(directory.path())
+        .get("future-record")
+        .expect_err("unsupported explicit schema versions must fail closed");
+    assert!(matches!(
+        error,
+        StoreError::CorruptRecord { ref reason, .. }
+            if reason.contains("unsupported record schema version 3")
+    ));
 }
 
 #[test]
@@ -218,6 +819,92 @@ fn inserting_the_same_id_does_not_replace_existing_knowledge() {
             .expect("original should remain")
             .content,
         "original"
+    );
+}
+
+#[test]
+fn rejected_duplicate_inserts_do_not_accumulate_index_entries() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("record-1", "authoritative"))
+        .expect("first insert should succeed");
+    assert_eq!(index_entry_count(directory.path()), 1);
+
+    for attempt in 0..20 {
+        let error = store
+            .insert(&record(
+                "record-1",
+                &format!("rejected replacement {attempt}"),
+            ))
+            .expect_err("duplicate id should stay write-once");
+        assert!(matches!(error, StoreError::AlreadyExists { .. }));
+    }
+
+    assert_eq!(
+        index_entry_count(directory.path()),
+        1,
+        "rejected duplicates must not consume durable index capacity"
+    );
+    let found = store
+        .query(&KnowledgeQuery {
+            text: Some("authoritative".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("the winning record should remain discoverable");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, "record-1");
+}
+
+#[test]
+fn concurrent_duplicate_inserts_keep_only_the_winning_index_entry() {
+    let directory = TestDir::new();
+    FileStore::new(directory.path())
+        .rebuild_index()
+        .expect("empty store should have a ready index before the race");
+
+    let writers = 16usize;
+    let barrier = Arc::new(Barrier::new(writers));
+    let mut handles = Vec::with_capacity(writers);
+    for writer in 0..writers {
+        let root = directory.path().to_path_buf();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let store = FileStore::new(root);
+            let candidate = record("raced-record", &format!("candidate {writer}"));
+            barrier.wait();
+            store.insert(&candidate).map(|()| candidate)
+        }));
+    }
+
+    let mut winner = None;
+    let mut duplicates = 0usize;
+    for handle in handles {
+        match handle.join().expect("writer thread should not panic") {
+            Ok(record) => {
+                assert!(
+                    winner.replace(record).is_none(),
+                    "exactly one writer may win"
+                );
+            }
+            Err(StoreError::AlreadyExists { .. }) => duplicates += 1,
+            Err(error) => panic!("concurrent duplicate write failed unexpectedly: {error}"),
+        }
+    }
+
+    let winner = winner.expect("one writer should publish the authoritative record");
+    assert_eq!(duplicates, writers - 1);
+    assert_eq!(
+        index_entry_count(directory.path()),
+        1,
+        "losing concurrent writers must reconcile their index entries"
+    );
+    assert_eq!(
+        FileStore::new(directory.path())
+            .get("raced-record")
+            .expect("winning record should be readable")
+            .expect("winning record should exist"),
+        winner
     );
 }
 
@@ -328,6 +1015,113 @@ fn query_discovers_active_knowledge_without_knowing_its_id() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "toolchain-rust");
+}
+
+#[test]
+fn query_addresses_knowledge_by_exact_scope_and_key() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&addressed_record(
+            "machine-rust",
+            "compiler lives at C:/Rust/bin/rustc.exe",
+            "machine",
+            "toolchain.rust.compiler_path",
+        ))
+        .expect("machine-addressed record should persist");
+    store
+        .insert(&addressed_record(
+            "project-rust",
+            "project overrides its compiler",
+            "project:synapse",
+            "toolchain.rust.compiler_path",
+        ))
+        .expect("project-addressed record should persist");
+
+    let hits = store
+        .query(&KnowledgeQuery {
+            scope: Some("machine".to_owned()),
+            key: Some("toolchain.rust.compiler_path".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("exact address query should succeed");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "machine-rust");
+
+    let wrong_case = store
+        .query(&KnowledgeQuery {
+            scope: Some("Machine".to_owned()),
+            key: Some("toolchain.rust.compiler_path".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("case-sensitive address query should succeed with no match");
+    assert!(wrong_case.is_empty());
+}
+
+#[test]
+fn multiple_active_records_can_share_an_address_without_silent_winner_selection() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    for (id, content) in [("path-a", "compiler path A"), ("path-b", "compiler path B")] {
+        store
+            .insert(&addressed_record(
+                id,
+                content,
+                "machine",
+                "toolchain.rust.compiler_path",
+            ))
+            .expect("same-address record should persist");
+    }
+
+    let hits = store
+        .query(&KnowledgeQuery {
+            scope: Some("machine".to_owned()),
+            key: Some("toolchain.rust.compiler_path".to_owned()),
+            limit: 10,
+            ..KnowledgeQuery::default()
+        })
+        .expect("same-address query should succeed");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(
+        hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+        vec!["path-a", "path-b"]
+    );
+}
+
+#[test]
+fn text_discovery_and_index_rebuild_include_scope_and_key() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&addressed_record(
+            "addressed",
+            "opaque value",
+            "machine",
+            "toolchain.rust.compiler_path",
+        ))
+        .expect("addressed record should persist");
+
+    let by_key_text = store
+        .query(&KnowledgeQuery {
+            text: Some("RUST.COMPILER_PATH".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("key text should be searchable");
+    assert_eq!(by_key_text.len(), 1);
+    assert_eq!(by_key_text[0].id, "addressed");
+
+    fs::remove_dir_all(directory.path().join("index-v1"))
+        .expect("derived index should be removable");
+    assert_eq!(store.rebuild_index().expect("rebuild should succeed"), 1);
+    let by_address = store
+        .query(&KnowledgeQuery {
+            scope: Some("machine".to_owned()),
+            key: Some("toolchain.rust.compiler_path".to_owned()),
+            ..KnowledgeQuery::default()
+        })
+        .expect("rebuilt index should retain address candidate bits");
+    assert_eq!(by_address.len(), 1);
+    assert_eq!(by_address[0].id, "addressed");
 }
 
 #[test]
@@ -474,6 +1268,26 @@ fn query_rejects_oversized_text_before_scanning() {
 }
 
 #[test]
+fn query_rejects_oversized_address_filters_before_scanning() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    let error = store
+        .query(&KnowledgeQuery {
+            scope: Some("x".repeat(257)),
+            ..KnowledgeQuery::default()
+        })
+        .expect_err("oversized scope should be rejected");
+
+    assert!(matches!(
+        error,
+        StoreError::QueryAddressTooLong {
+            field: "scope",
+            max_bytes: 256
+        }
+    ));
+}
+
+#[test]
 fn legacy_store_over_scan_ceiling_requires_then_accepts_index_rebuild() {
     let directory = TestDir::new();
     let records_dir = directory.path().join("records");
@@ -523,6 +1337,45 @@ fn legacy_store_over_scan_ceiling_requires_then_accepts_index_rebuild() {
         .expect("rebuilt index should support discovery past the legacy ceiling");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "record-256");
+}
+
+#[test]
+fn index_rebuild_handles_mixed_legacy_and_versioned_record_files() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    store
+        .insert(&record("versioned", "versioned migration needle"))
+        .expect("versioned record should persist");
+
+    fs::remove_dir_all(directory.path().join("index-v1"))
+        .expect("fixture should remove the derived index");
+    let legacy = record("legacy", "legacy migration needle");
+    fs::write(
+        record_path(directory.path(), "legacy"),
+        serde_json::to_vec(&legacy).expect("legacy record should serialize"),
+    )
+    .expect("legacy record should be written");
+
+    assert_eq!(
+        FileStore::new(directory.path())
+            .rebuild_index()
+            .expect("mixed-format rebuild should succeed"),
+        2
+    );
+
+    for (needle, expected_id) in [
+        ("versioned migration needle", "versioned"),
+        ("legacy migration needle", "legacy"),
+    ] {
+        let hits = FileStore::new(directory.path())
+            .query(&KnowledgeQuery {
+                text: Some(needle.to_owned()),
+                ..KnowledgeQuery::default()
+            })
+            .expect("mixed-format indexed query should succeed");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, expected_id);
+    }
 }
 
 #[test]
@@ -750,6 +1603,69 @@ fn a_resolution_record_can_supersede_both_conflict_branches() {
 }
 
 #[test]
+fn new_relation_files_include_an_explicit_schema_version() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    for id in ["a", "b"] {
+        store
+            .insert(&record(id, &format!("record {id}")))
+            .expect("endpoint should persist");
+    }
+    store
+        .insert_relation(&relation(
+            "versioned-relation",
+            "a",
+            KnowledgeRelationKind::ConflictsWith,
+            "b",
+        ))
+        .expect("relation should persist");
+
+    let stored: serde_json::Value = serde_json::from_slice(
+        &fs::read(relation_path(directory.path(), "versioned-relation"))
+            .expect("relation file should be readable"),
+    )
+    .expect("relation file should contain JSON");
+    assert_eq!(stored["schema_version"], 1);
+    assert_eq!(stored["relation"]["id"], "versioned-relation");
+}
+
+#[test]
+fn explicit_future_relation_schema_versions_fail_closed() {
+    let directory = TestDir::new();
+    let store = FileStore::new(directory.path());
+    for id in ["a", "b"] {
+        store
+            .insert(&record(id, &format!("record {id}")))
+            .expect("endpoint should persist");
+    }
+    let relations_dir = directory.path().join("relations");
+    fs::create_dir_all(&relations_dir).expect("relations directory should exist");
+    let future = serde_json::json!({
+        "schema_version": 2,
+        "relation": relation(
+            "future-relation",
+            "a",
+            KnowledgeRelationKind::ConflictsWith,
+            "b",
+        )
+    });
+    fs::write(
+        relation_path(directory.path(), "future-relation"),
+        serde_json::to_vec(&future).expect("future relation fixture should serialize"),
+    )
+    .expect("future relation fixture should be written");
+
+    let error = store
+        .query(&KnowledgeQuery::default())
+        .expect_err("unsupported relation schema versions must fail closed");
+    assert!(matches!(
+        error,
+        StoreError::CorruptRelation { ref reason, .. }
+            if reason.contains("unsupported relation schema version 2")
+    ));
+}
+
+#[test]
 fn relation_endpoints_must_already_exist() {
     let directory = TestDir::new();
     let store = FileStore::new(directory.path());
@@ -860,6 +1776,57 @@ fn supersession_cycles_are_rejected() {
 }
 
 #[test]
+fn concurrent_supersession_writers_cannot_publish_a_cycle() {
+    let directory = TestDir::new();
+    let writers = 16usize;
+    let store = FileStore::new(directory.path());
+    for index in 0..writers {
+        let id = format!("cycle-{index}");
+        store
+            .insert(&record(&id, &format!("cycle record {index}")))
+            .expect("cycle fixture record should persist");
+    }
+
+    let barrier = Arc::new(Barrier::new(writers));
+    let mut handles = Vec::with_capacity(writers);
+    for index in 0..writers {
+        let root = directory.path().to_path_buf();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let subject = format!("cycle-{index}");
+            let object = format!("cycle-{}", (index + 1) % writers);
+            let edge = relation(
+                &format!("cycle-edge-{index}"),
+                &subject,
+                KnowledgeRelationKind::Supersedes,
+                &object,
+            );
+            barrier.wait();
+            FileStore::new(root).insert_relation(&edge)
+        }));
+    }
+
+    let mut inserted = 0usize;
+    let mut cycle_rejections = 0usize;
+    for handle in handles {
+        match handle
+            .join()
+            .expect("relation writer thread should not panic")
+        {
+            Ok(()) => inserted += 1,
+            Err(StoreError::SupersessionCycle) => cycle_rejections += 1,
+            Err(error) => panic!("concurrent relation write failed unexpectedly: {error}"),
+        }
+    }
+
+    assert_eq!(inserted, writers - 1);
+    assert_eq!(cycle_rejections, 1);
+    FileStore::new(directory.path())
+        .query(&KnowledgeQuery::default())
+        .expect("serialized lifecycle writes must leave an acyclic readable graph");
+}
+
+#[test]
 fn authoritative_writes_require_configured_authorization() {
     let directory = TestDir::unconfigured();
     let store = FileStore::new(directory.path());
@@ -945,6 +1912,33 @@ fn authorization_separates_record_and_relation_permissions() {
             "relation-writer",
         ))
         .expect("relation writer should be authorized");
+
+    let successor = record_with(
+        "successor",
+        "replacement value",
+        "fact",
+        "record-writer",
+        20,
+        KnowledgeState::Active,
+    );
+    let supersedes = relation_with_source(
+        "successor-edge",
+        "successor",
+        KnowledgeRelationKind::Supersedes,
+        "a",
+        "record-writer",
+    );
+    let error = store
+        .insert_successor(&successor, &supersedes)
+        .expect_err("record-only writer must not publish an atomic successor");
+    assert!(matches!(
+        error,
+        StoreError::AuthorizationDenied {
+            ref client_id,
+            capability: "write_relations"
+        } if client_id == "record-writer"
+    ));
+    assert!(!encoded_path(directory.path(), "successors-v1", "successor").exists());
 }
 
 #[test]

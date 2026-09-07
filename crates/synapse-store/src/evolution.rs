@@ -1,62 +1,69 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
+    path::Path,
+    thread,
+    time::{Duration, Instant},
 };
 
+use fs2::FileExt;
 use synapse_core::knowledge::{
     KnowledgeRecord, KnowledgeRelation, KnowledgeRelationKind, KnowledgeState,
 };
 
 use super::{
-    create_private_dir_all, create_temporary_file, record_file_name, record_id_from_file_name,
-    FileStore, KnowledgeStatus, StoreError,
+    create_private_dir_all, create_temporary_file, format, record_file_name,
+    record_id_from_file_name, successor, FileStore, KnowledgeStatus, StoreError,
 };
 
-const MAX_RELATION_BYTES: usize = 16 * 1024;
-const MAX_RELATIONS: usize = 4_096;
+pub(super) const MAX_RELATION_BYTES: usize = 16 * 1024;
+pub(super) const MAX_RELATIONS: usize = 4_096;
+const RELATION_MUTATION_LOCK_FILE: &str = ".mutation.lock";
+const RELATION_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const RELATION_MUTATION_LOCK_RETRY: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Default)]
 pub(super) struct RelationGraph {
     superseded_by: HashMap<String, Vec<KnowledgeRelation>>,
     conflicts_with: HashMap<String, Vec<KnowledgeRelation>>,
     supersedes: HashMap<String, Vec<String>>,
+    relation_ids: HashSet<String>,
 }
 
 impl RelationGraph {
     pub(super) fn load(store: &FileStore) -> Result<Self, StoreError> {
-        let entries = match fs::read_dir(store.relations_dir()) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(StoreError::Io(error)),
-        };
-
         let mut graph = Self::default();
-        let mut count = 0usize;
-        for entry in entries {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let Some(id) = record_id_from_file_name(&entry.file_name()) else {
-                continue;
-            };
 
-            count += 1;
-            if count > MAX_RELATIONS {
-                return Err(StoreError::RelationCapacityExceeded {
-                    max_relations: MAX_RELATIONS,
-                });
+        match fs::read_dir(store.relations_dir()) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let Some(id) = record_id_from_file_name(&entry.file_name()) else {
+                        continue;
+                    };
+                    let relation =
+                        read_relation(store, &id)?.ok_or_else(|| StoreError::CorruptRelation {
+                            id: id.clone(),
+                            reason: "relation disappeared while loading the evolution graph"
+                                .to_owned(),
+                        })?;
+                    require_endpoint_path(store, &relation.subject_id, &relation.id)?;
+                    require_endpoint_path(store, &relation.object_id, &relation.id)?;
+                    graph.add(relation)?;
+                }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error)),
+        }
 
-            let relation =
-                read_relation(store, &id)?.ok_or_else(|| StoreError::CorruptRelation {
-                    id: id.clone(),
-                    reason: "relation disappeared while loading the evolution graph".to_owned(),
-                })?;
+        for relation in successor::relations(store)? {
             require_endpoint_path(store, &relation.subject_id, &relation.id)?;
             require_endpoint_path(store, &relation.object_id, &relation.id)?;
-            graph.add(relation);
+            graph.add(relation)?;
         }
 
         if graph.has_supersession_cycle() {
@@ -127,6 +134,14 @@ impl RelationGraph {
         false
     }
 
+    pub(super) fn contains_relation_id(&self, id: &str) -> bool {
+        self.relation_ids.contains(id)
+    }
+
+    pub(super) fn relation_count(&self) -> usize {
+        self.relation_ids.len()
+    }
+
     fn has_supersession_cycle(&self) -> bool {
         self.supersedes.iter().any(|(subject, objects)| {
             objects
@@ -135,7 +150,20 @@ impl RelationGraph {
         })
     }
 
-    fn add(&mut self, relation: KnowledgeRelation) {
+    fn add(&mut self, relation: KnowledgeRelation) -> Result<(), StoreError> {
+        if self.relation_ids.len() >= MAX_RELATIONS {
+            return Err(StoreError::RelationCapacityExceeded {
+                max_relations: MAX_RELATIONS,
+            });
+        }
+        if !self.relation_ids.insert(relation.id.clone()) {
+            return Err(StoreError::CorruptRelation {
+                id: relation.id.clone(),
+                reason: "relation id appears in more than one authoritative lifecycle file"
+                    .to_owned(),
+            });
+        }
+
         match relation.kind {
             KnowledgeRelationKind::Supersedes => {
                 self.supersedes
@@ -158,6 +186,7 @@ impl RelationGraph {
                     .push(relation);
             }
         }
+        Ok(())
     }
 }
 
@@ -169,17 +198,7 @@ pub(super) fn insert_relation(
     require_endpoint_record(store, &relation.subject_id)?;
     require_endpoint_record(store, &relation.object_id)?;
 
-    let graph = RelationGraph::load(store)?;
-    if relation.kind == KnowledgeRelationKind::Supersedes
-        && graph.would_create_supersession_cycle(&relation.subject_id, &relation.object_id)
-    {
-        return Err(StoreError::SupersessionCycle);
-    }
-
-    let serialized = serde_json::to_vec(relation).map_err(|error| StoreError::CorruptRelation {
-        id: relation.id.clone(),
-        reason: error.to_string(),
-    })?;
+    let serialized = format::serialize_relation(relation)?;
     if serialized.len() > MAX_RELATION_BYTES {
         return Err(StoreError::RelationTooLarge {
             max_bytes: MAX_RELATION_BYTES,
@@ -188,6 +207,25 @@ pub(super) fn insert_relation(
 
     let directory = store.relations_dir();
     create_private_dir_all(&directory)?;
+    let _mutation_lock = acquire_relation_mutation_lock(&directory)?;
+
+    let graph = RelationGraph::load(store)?;
+    if graph.contains_relation_id(&relation.id) {
+        return Err(StoreError::RelationAlreadyExists {
+            id: relation.id.clone(),
+        });
+    }
+    if graph.relation_count() >= MAX_RELATIONS {
+        return Err(StoreError::RelationCapacityExceeded {
+            max_relations: MAX_RELATIONS,
+        });
+    }
+    if relation.kind == KnowledgeRelationKind::Supersedes
+        && graph.would_create_supersession_cycle(&relation.subject_id, &relation.object_id)
+    {
+        return Err(StoreError::SupersessionCycle);
+    }
+
     let final_path = directory.join(record_file_name(&relation.id)?);
     let (temporary_path, mut temporary_file) = create_temporary_file(&directory)?;
     let result = (|| -> Result<(), StoreError> {
@@ -208,6 +246,65 @@ pub(super) fn insert_relation(
 
     let _ = fs::remove_file(&temporary_path);
     result
+}
+
+pub(super) fn acquire_relation_mutation_lock(directory: &Path) -> Result<File, StoreError> {
+    let path = directory.join(RELATION_MUTATION_LOCK_FILE);
+    let file = open_relation_lock_file(&path)?;
+    let deadline = Instant::now() + RELATION_MUTATION_LOCK_TIMEOUT;
+
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if relation_lock_is_contended(&error) => {
+                if Instant::now() >= deadline {
+                    return Err(StoreError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the knowledge relation mutation lock",
+                    )));
+                }
+                thread::sleep(RELATION_MUTATION_LOCK_RETRY);
+            }
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+    }
+}
+
+fn relation_lock_is_contended(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        return true;
+    }
+
+    false
+}
+
+#[cfg(unix)]
+fn open_relation_lock_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600);
+    options.open(path)
+}
+
+#[cfg(not(unix))]
+fn open_relation_lock_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
 }
 
 fn read_relation(store: &FileStore, id: &str) -> Result<Option<KnowledgeRelation>, StoreError> {
@@ -233,11 +330,7 @@ fn read_relation(store: &FileStore, id: &str) -> Result<Option<KnowledgeRelation
         });
     }
 
-    let relation: KnowledgeRelation =
-        serde_json::from_slice(&serialized).map_err(|error| StoreError::CorruptRelation {
-            id: id.to_owned(),
-            reason: error.to_string(),
-        })?;
+    let relation = format::deserialize_relation(id, &serialized)?;
     if relation.id != id {
         return Err(StoreError::CorruptRelation {
             id: id.to_owned(),
@@ -260,19 +353,13 @@ fn require_endpoint_path(
     endpoint_id: &str,
     relation_id: &str,
 ) -> Result<(), StoreError> {
-    let path = store.records_dir().join(record_file_name(endpoint_id)?);
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(()),
-        Ok(_) => Err(StoreError::CorruptRelation {
-            id: relation_id.to_owned(),
-            reason: format!("endpoint '{endpoint_id}' is not a record file"),
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StoreError::CorruptRelation {
-            id: relation_id.to_owned(),
-            reason: format!("endpoint '{endpoint_id}' does not exist"),
-        }),
-        Err(error) => Err(StoreError::Io(error)),
+    if store.record_storage_exists(endpoint_id)? {
+        return Ok(());
     }
+    Err(StoreError::CorruptRelation {
+        id: relation_id.to_owned(),
+        reason: format!("endpoint '{endpoint_id}' does not exist"),
+    })
 }
 
 fn sort_relations(relations: &mut [KnowledgeRelation]) {

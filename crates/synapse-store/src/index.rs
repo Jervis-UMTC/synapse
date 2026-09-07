@@ -10,7 +10,7 @@ use synapse_core::knowledge::{KnowledgeRecord, KnowledgeState, ProvenanceBasis};
 
 use super::{
     create_private_dir_all, create_temporary_file, record_file_name, record_id_from_file_name,
-    FileStore, KnowledgeQuery, StoreError, MAX_QUERY_CANDIDATES,
+    successor, FileStore, KnowledgeQuery, StoreError, MAX_QUERY_CANDIDATES,
 };
 
 const INDEX_DIR_NAME: &str = "index-v1";
@@ -52,45 +52,50 @@ pub(super) fn is_ready(store: &FileStore) -> Result<bool, StoreError> {
 }
 
 pub(super) fn rebuild(store: &FileStore) -> Result<usize, StoreError> {
-    let records_dir = store.records_dir();
-    let entries = match fs::read_dir(&records_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            create_private_dir_all(&index_dir(store))?;
-            publish_ready_marker(store)?;
-            return Ok(0);
+    let mut ids = Vec::new();
+    match fs::read_dir(store.records_dir()) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let Some(id) = record_id_from_file_name(&entry.file_name()) else {
+                    continue;
+                };
+                ids.push(id);
+                if ids.len() > MAX_INDEX_RECORDS {
+                    return Err(StoreError::IndexCapacityExceeded {
+                        max_records: MAX_INDEX_RECORDS,
+                    });
+                }
+            }
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(StoreError::Io(error)),
-    };
-
-    let mut indexed = 0usize;
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let Some(id) = record_id_from_file_name(&entry.file_name()) else {
-            continue;
-        };
-
-        indexed += 1;
-        if indexed > MAX_INDEX_RECORDS {
+    }
+    for id in successor::record_ids(store)? {
+        ids.push(id);
+        if ids.len() > MAX_INDEX_RECORDS {
             return Err(StoreError::IndexCapacityExceeded {
                 max_records: MAX_INDEX_RECORDS,
             });
         }
+    }
 
-        let record = store.get(&id)?.ok_or_else(|| StoreError::CorruptIndex {
-            reason: format!("record '{id}' disappeared during index rebuild"),
-        })?;
-        let serialized = serde_json::to_vec(&record).map_err(|error| StoreError::CorruptIndex {
-            reason: format!("failed to serialize record '{id}' for indexing: {error}"),
-        })?;
+    for id in &ids {
+        let (record, serialized) =
+            store
+                .read_record_with_serialized(id)?
+                .ok_or_else(|| StoreError::CorruptIndex {
+                    reason: format!("record '{id}' disappeared during index rebuild"),
+                })?;
         publish_record_entry(store, &record, &serialized)?;
     }
 
+    create_private_dir_all(&index_dir(store))?;
     publish_ready_marker(store)?;
-    Ok(indexed)
+    Ok(ids.len())
 }
 
 pub(super) fn publish_record_entry(
@@ -126,12 +131,43 @@ pub(super) fn publish_record_entry(
     result
 }
 
+pub(super) fn reconcile_duplicate_record_entry(
+    store: &FileStore,
+    attempted_record: &KnowledgeRecord,
+    attempted_serialized: &[u8],
+) -> Result<(), StoreError> {
+    let (winning_record, winning_serialized) = store
+        .read_record_with_serialized(&attempted_record.id)?
+        .ok_or_else(|| StoreError::CorruptIndex {
+            reason: format!(
+                "record '{}' disappeared while reconciling a concurrent duplicate insert",
+                attempted_record.id
+            ),
+        })?;
+
+    publish_record_entry(store, &winning_record, &winning_serialized)?;
+
+    let attempted_path = index_dir(store).join(index_entry_file_name(attempted_serialized));
+    let winning_path = index_dir(store).join(index_entry_file_name(&winning_serialized));
+    if attempted_path == winning_path {
+        return Ok(());
+    }
+
+    match fs::remove_file(attempted_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StoreError::Io(error)),
+    }
+}
+
 pub(super) fn candidate_ids(
     store: &FileStore,
     query: &KnowledgeQuery,
     normalized_text: Option<&str>,
 ) -> Result<Vec<String>, StoreError> {
     let entries = fs::read_dir(index_dir(store))?;
+    let normalized_scope = query.scope.as_ref().map(|scope| scope.to_lowercase());
+    let normalized_key = query.key.as_ref().map(|key| key.to_lowercase());
     let mut index_entries = 0usize;
     let mut candidates = HashSet::new();
 
@@ -151,7 +187,13 @@ pub(super) fn candidate_ids(
         }
 
         let decoded = read_entry(&entry.path())?;
-        if !entry_matches_query(&decoded, query, normalized_text) {
+        if !entry_matches_query(
+            &decoded,
+            query,
+            normalized_text,
+            normalized_scope.as_deref(),
+            normalized_key.as_deref(),
+        ) {
             continue;
         }
 
@@ -332,6 +374,8 @@ fn entry_matches_query(
     entry: &IndexEntry,
     query: &KnowledgeQuery,
     normalized_text: Option<&str>,
+    normalized_scope: Option<&str>,
+    normalized_key: Option<&str>,
 ) -> bool {
     if query
         .kind
@@ -353,6 +397,12 @@ fn entry_matches_query(
     {
         return false;
     }
+    if normalized_scope.is_some_and(|scope| !bloom_may_contain(&entry.bloom, scope.as_bytes())) {
+        return false;
+    }
+    if normalized_key.is_some_and(|key| !bloom_may_contain(&entry.bloom, key.as_bytes())) {
+        return false;
+    }
 
     normalized_text.is_none_or(|text| bloom_may_contain(&entry.bloom, text.as_bytes()))
 }
@@ -364,6 +414,8 @@ fn build_bloom(record: &KnowledgeRecord) -> [u8; BLOOM_BYTES] {
         Some(record.content.as_str()),
         Some(record.kind.as_str()),
         Some(record.source.as_str()),
+        record.scope.as_deref(),
+        record.key.as_deref(),
         record.provenance.detail.as_deref(),
     ]
     .into_iter()
