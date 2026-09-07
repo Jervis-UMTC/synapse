@@ -24,7 +24,7 @@ Task 1 deliberately does not choose a database schema, daemon protocol, semantic
 
 ## Task 2 boundary
 
-Task 2 adds the first transport- and storage-independent knowledge domain model. `KnowledgeRecord` preserves source, confidence, lifecycle state, and whether provenance is observed or inferred. Required text fields are validated on construction and deserialization. The CLI can construct a record and emit JSON as a proof exchange path, but Task 2 intentionally adds no persistence or retrieval layer.
+Task 2 adds the first transport- and storage-independent knowledge domain model. `KnowledgeRecord` preserves source, confidence, lifecycle state, whether provenance is observed or inferred, and an optional paired `scope + key` logical address. Required text fields and paired address shape are validated on construction and deserialization. The CLI can construct a record and emit JSON as a proof exchange path, while persistence and retrieval remain outside the core domain crate.
 
 See [`knowledge-model.md`](knowledge-model.md) for the current record contract and deferred decisions.
 
@@ -36,7 +36,7 @@ See [`storage.md`](storage.md) for persistence guarantees, data-directory behavi
 
 ## Task 4 boundary
 
-Task 4 adds bounded lexical discovery without introducing an AI or semantic-search dependency. `KnowledgeQuery` supports text plus exact metadata filters, defaults to active knowledge, returns at most 10 validated records in deterministic newest-first order, and refuses to scan beyond 256 persisted records rather than returning an arbitrary partial view. The CLI exposes this as `synapse knowledge find` with JSON-array output for unrelated local tools.
+Task 4 adds bounded lexical discovery without introducing an AI or semantic-search dependency. `KnowledgeQuery` supports text plus exact metadata filters, including optional exact `scope` and `key` filters, defaults to active knowledge, returns at most 10 validated records in deterministic newest-first order, and refuses to scan beyond bounded candidate/legacy-scan limits rather than returning an arbitrary partial view. The CLI exposes this as `synapse knowledge find` with JSON-array output for unrelated local tools.
 
 See [`retrieval.md`](retrieval.md) for matching semantics, bounds, ordering, and the scale trigger for a future durable index.
 
@@ -67,6 +67,28 @@ Task 8 adds `synapse-ipc`, a local-socket service that can mediate ordinary know
 The current Windows runtime proof uses local named pipes and rejects source spoofing from a connected process. This improves Task 7's claimed-string boundary, but safe deployment still requires OS permissions that prevent ordinary clients from modifying the store, authorization policy, or trust directory directly. Task 8 does not install a privileged service or claim process-image attestation.
 
 See [`ipc.md`](ipc.md) for transport, trust bootstrap, peer authentication, bounds, CLI routing, and remaining OS-isolation requirements.
+
+## Schema compatibility boundary
+
+Authoritative addressless records and relations retain explicit `schema_version = 1` JSON envelopes. Records (and atomic successors) carrying paired `scope + key` addressing use record schema version `2`; schema-v1 records are forbidden from carrying address fields. Existing flat v0.1 addressless record/relation files remain readable as implicit schema 1, while an explicit unsupported version fails closed before Synapse interprets the payload. Derived index identity is computed from the exact authoritative bytes that were read, allowing mixed legacy/current stores to rebuild without rewriting history.
+
+IPC request and response JSON now uses protocol v2 for the address-aware contract while retaining safe v1 compatibility for addressless operations. Missing protocol version is treated as the original v1 shape. Address-aware writes/queries use v2-only operation names so a pre-v2 server rejects them instead of silently discarding `scope` / `key`; a current server also refuses to return addressed data to a v1 peer. Protocol, executable-trust-entry, and endpoint-namespace versions remain independent.
+
+## Stable knowledge address boundary
+
+`KnowledgeRecord.scope + key` gives unrelated tools a shared logical name for the fact a record describes. For example, different clients can refer to `machine / toolchain.rust.compiler_path` even when their human-readable `content` strings differ. The address is optional for backward compatibility and is not a unique primary key: multiple active records may share it, allowing uncertainty or disagreement to remain visible. Exact address retrieval returns all current matches within normal bounds; append-only `supersedes` / `conflicts_with` relations remain responsible for explicit lifecycle resolution.
+
+The existing index-v1 binary layout is retained. `scope` and `key` contribute to the candidate-only Bloom filter, while the authoritative record is reopened for exact case-sensitive address comparison. This preserves the established rule that derived index data cannot become knowledge truth.
+
+## Stable store identity boundary
+
+`store-identity-v1.json` gives each initialized store a durable 64-hex-character identity used for local IPC naming. Bootstrap intentionally seeds the ID with the old path-derived SHA-256 value, preserving the previous endpoint name for an existing store first opened at the same path. After publication, the identity file is authoritative, so path aliases and later directory moves no longer rename the endpoint. The ID is bounded, validated, write-once through the API, and explicitly not a credential. Copying it clones endpoint identity; simultaneous cloned stores therefore require operator separation until a future explicit fork workflow exists.
+
+## Atomic replacement boundary
+
+A new `FileStore::insert_successor` / `synapse knowledge replace` path publishes one successor record and its single `supersedes` assertion as one versioned authoritative file. A synchronized hard-link publication means readers never intentionally observe the new record as current without the paired supersession assertion. A root shared/exclusive OS file lock coordinates multi-file currentness reads with all authoritative writes, while record/relation IDs and existing size/cycle/authorization bounds remain shared across standalone and combined storage. The IPC protocol exposes the same generic operation and authenticates both nested sources to the same peer identity.
+
+This is deliberately a focused one-predecessor replacement primitive, not a general transaction engine or multi-record commit system.
 
 ## Continuity note
 

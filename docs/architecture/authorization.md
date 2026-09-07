@@ -65,6 +65,8 @@ Task 7 intentionally exposes only two capabilities:
 
 These permissions are separate because lifecycle assertions can change what unrelated tools consider current knowledge even though they do not rewrite historical records. A machine observation tool can therefore be allowed to contribute records without automatically receiving permission to supersede or conflict with another tool's knowledge.
 
+Atomic successor publication intentionally requires **both** capabilities. The combined record and relation must use the same `source`; authorization is checked for `write_records` and `write_relations` before the combined authoritative file or its derived index entry is published. A record-only client therefore cannot bypass lifecycle authority by using the atomic replacement API.
+
 Authorization is checked before index preparation, endpoint validation, or authoritative publication. A denied record write must not leave a record or derived index entry behind. A denied relation write must not publish relation data.
 
 ## Bootstrap and administration
@@ -95,7 +97,7 @@ Derived index rebuild is intentionally outside the capability model because it r
 
 Task 7 by itself remains **authorization without strong authentication**: direct `FileStore` callers present a claimed `source` string. Task 8 adds an optional local IPC boundary that authenticates write requests against an OS-reported peer process and a trusted executable fingerprint before this policy is evaluated. See [`ipc.md`](ipc.md).
 
-Direct storage access is still an administrative/trusted path. A process that can modify the store root can bypass IPC, replace policy/trust files, or write authoritative files directly. A hardened deployment must therefore give the service control of those files and restrict ordinary clients to the local endpoint.
+Direct storage access is still an administrative/trusted path. A process that can modify the store root can bypass IPC, replace policy/trust/store-identity files, redirect the local endpoint identity, or write authoritative files directly. A hardened deployment must therefore give the service control of those files and restrict ordinary clients to the local endpoint.
 
 The authorization policy contains identifiers and booleans only. Task 8 executable-trust entries add hashes, not passwords, API keys, tokens, cookies, or private-key material.
 

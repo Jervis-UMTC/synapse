@@ -4,9 +4,7 @@
 
 Synapse gives local CLIs, agents, scripts, IDE tools, and other programs a small common place to publish and retrieve durable machine knowledge without requiring them to share a model, prompt history, agent framework, or hosted memory service.
 
-> **The product test:** does this make useful knowledge discovered by one local tool safely reusable by another unrelated tool?
-
-Synapse is an early-stage Rust project (`v0.1`) with a working knowledge model, durable local storage, bounded retrieval, append-only knowledge evolution, write authorization, and authenticated local IPC.
+Synapse is an early-stage Rust project (`v0.1`) with a working knowledge model, durable local storage, stable logical knowledge addresses, bounded retrieval, append-only knowledge evolution, write authorization, and authenticated local IPC.
 
 ## Why Synapse?
 
@@ -48,9 +46,11 @@ The goal is not to collect every action a tool performs. Synapse favors **small,
 | Storage-independent knowledge model | ✅ | Records preserve source, confidence, state, and observed/inferred provenance. |
 | Durable local persistence | ✅ | Write-once validated JSON records with path-safe IDs and bounded reads. |
 | Cross-process reuse | ✅ | One process can persist knowledge and another can retrieve it later. |
+| Stable logical addressing | ✅ | Optional paired `scope + key` lets unrelated tools name the same fact without sharing prose or record IDs. |
 | Lexical discovery | ✅ | Bounded case-insensitive retrieval with metadata filters and deterministic ordering. |
 | Durable retrieval index | ✅ | Derived bounded index accelerates discovery while authoritative records remain the source of truth. |
 | Knowledge evolution | ✅ | Append-only `supersedes` and `conflicts_with` relations preserve history. |
+| Atomic replacement | ✅ | A successor record and its `supersedes` assertion can publish as one crash-safe authoritative commit. |
 | Local write authorization | ✅ | Separate capabilities for record writes and lifecycle-relation writes. |
 | Authenticated local IPC | ✅ | Local-socket writes bind `source` to an OS-reported peer process and trusted executable fingerprint. |
 | Semantic/vector retrieval | Not yet | Intentionally deferred until it is justified by the core use case. |
@@ -134,7 +134,7 @@ cargo run -p synapse-cli -- authorization init inspector
 Persist an observation:
 
 ```bash
-cargo run -p synapse-cli -- knowledge add rust-toolchain fact inspector observed high "Rust is installed"
+cargo run -p synapse-cli -- knowledge add rust-toolchain fact inspector observed high "Rust is installed" --scope machine --key toolchain.rust.compiler_path
 ```
 
 Retrieve it from a separate invocation:
@@ -143,29 +143,46 @@ Retrieve it from a separate invocation:
 cargo run -p synapse-cli -- knowledge show rust-toolchain
 ```
 
-Or discover it without knowing the record ID:
+Or retrieve the logical fact without knowing the record ID or matching its prose:
 
 ```bash
-cargo run -p synapse-cli -- knowledge find "Rust"
+cargo run -p synapse-cli -- knowledge find --scope machine --key toolchain.rust.compiler_path
 ```
 
-A record is serialized as ordinary JSON, for example:
+`scope + key` is an address, not a uniqueness constraint. If unrelated tools publish multiple active records at the same address, Synapse returns the matching records rather than silently deciding which writer is correct.
+
+When a fact changes, publish the successor and the supersession assertion together instead of exposing a two-step replacement window:
+
+```bash
+cargo run -p synapse-cli -- knowledge replace rust-toolchain-v2 fact inspector observed high "Rust moved to a new toolchain path" rust-toolchain-moved rust-toolchain --scope machine --key toolchain.rust.compiler_path
+```
+
+The old record remains readable as history, but normal current discovery resolves it as superseded as soon as the combined replacement becomes authoritative.
+
+A new standalone record file uses an explicit versioned JSON envelope, for example:
 
 ```json
 {
-  "id": "rust-toolchain",
-  "content": "Rust is installed",
-  "kind": "fact",
-  "source": "inspector",
-  "created_at_unix_ms": 0,
-  "confidence": "high",
-  "state": "active",
-  "provenance": {
-    "basis": "observed",
-    "detail": null
+  "schema_version": 2,
+  "record": {
+    "id": "rust-toolchain",
+    "content": "Rust is installed",
+    "kind": "fact",
+    "source": "inspector",
+    "scope": "machine",
+    "key": "toolchain.rust.compiler_path",
+    "created_at_unix_ms": 0,
+    "confidence": "high",
+    "state": "active",
+    "provenance": {
+      "basis": "observed",
+      "detail": null
+    }
   }
 }
 ```
+
+Legacy flat v0.1 record JSON remains readable. Addressless records retain schema version 1; records with paired `scope + key` addressing use schema version 2 so older formats cannot silently discard the address.
 
 `created_at_unix_ms` is supplied at runtime; `0` above is only a shortened documentation example.
 
@@ -249,7 +266,7 @@ docs/architecture/
 
 ## Documentation
 
-The repository documentation is intended to be the durable source of architectural truth rather than relying on old chat context or generated plans.
+Architecture and operational contracts are documented under `docs/` and kept in sync with the implementation.
 
 - [Architecture overview](docs/architecture/overview.md)
 - [Knowledge model](docs/architecture/knowledge-model.md)

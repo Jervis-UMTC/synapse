@@ -13,13 +13,15 @@ This is deliberately lexical retrieval. It does not add embeddings, a vector dat
 - `text`: optional case-normalized substring text.
 - `kind`: optional exact `kind` filter.
 - `source`: optional exact `source` filter.
+- `scope`: optional exact logical-scope filter.
+- `key`: optional exact logical-key filter.
 - `state`: optional lifecycle-state filter. The default is `active`.
 - `provenance_basis`: optional exact `observed` / `inferred` filter.
 - `limit`: maximum returned records. The default is 5 and the hard maximum is 10.
 
-Text matching checks record ID, content, kind, source, and optional provenance detail. Text is normalized with Rust lowercase conversion before substring comparison. This is simple lexical matching, not tokenization or linguistic case folding.
+Text matching checks record ID, content, kind, source, optional `scope`, optional `key`, and optional provenance detail. Text is normalized with Rust lowercase conversion before substring comparison. This is simple lexical matching, not tokenization or linguistic case folding.
 
-Exact metadata filters remain case-sensitive because those values are caller-defined identifiers/categories rather than free-text search terms.
+Exact metadata filters—including `scope` and `key`—remain case-sensitive because those values are caller-defined identifiers/categories rather than free-text search terms. `scope + key` is an address filter, not a uniqueness guarantee: if multiple active records share an address, retrieval returns all matching records up to the normal result bound instead of silently picking a winner.
 
 ## Currentness and ordering
 
@@ -31,7 +33,7 @@ Matching hits are returned newest first by the immutable record's `created_at_un
 
 ## Bounds and failure behavior
 
-Retrieval is intentionally bounded. Task 5 now uses a compact durable index for normal discovery: index filtering may produce at most 256 unique candidate IDs, and at most 10 validated full records can be returned. Query text remains limited to 256 UTF-8 bytes and authoritative records retain the existing 1 MiB bound.
+Retrieval is intentionally bounded. Task 5 now uses a compact durable index for normal discovery: index filtering may produce at most 256 unique candidate IDs, and at most 10 validated full records can be returned. Query text, `scope`, and `key` filters are each limited to 256 UTF-8 bytes and authoritative records retain the existing 1 MiB bound.
 
 Pre-index stores keep the Task 4 compatibility path. They may scan at most 256 authoritative record files; a larger legacy store returns an explicit index-rebuild-required error instead of an arbitrary partial result. `synapse knowledge index rebuild` upgrades that derived retrieval state without rewriting authoritative records.
 
@@ -44,12 +46,12 @@ The index-v1 stored-state byte is retained for format compatibility but is no lo
 The current discovery command is:
 
 ```text
-synapse knowledge find <text> [--kind <kind>] [--source <source>] [--state <active|stale|conflicted|superseded|unknown|any>] [--basis <observed|inferred|any>] [--limit <1..10>]
+synapse knowledge find [<text>] [--kind <kind>] [--source <source>] [--scope <scope>] [--key <key>] [--state <active|stale|conflicted|superseded|unknown|any>] [--basis <observed|inferred|any>] [--limit <1..10>]
 ```
 
 The command uses the same local data-directory behavior as `knowledge add` and `knowledge show`, including the `SYNAPSE_STORE` override. It emits a JSON array of `KnowledgeHit` objects: complete validated record fields plus `effective_state`, so an unrelated local process can consume currentness without scraping human-oriented output. Task 7 authorization applies only to authoritative writes; discovery remains readable without a writer grant.
 
-`--state any` removes the default active-state filter. `--basis any` removes the provenance-basis filter.
+The CLI accepts filter-only discovery, so a client can resolve an address without inventing search prose, for example `synapse knowledge find --scope machine --key toolchain.rust.compiler_path`. At least one text or option constraint is still required; bare `knowledge find` is rejected. `--state any` removes the default active-state filter. `--basis any` removes the provenance-basis filter.
 
 ## Deferred work
 

@@ -14,12 +14,13 @@ A knowledge record contains:
 - `content`: the useful knowledge being shared.
 - `kind`: an extensible caller-supplied category such as `fact`, `decision`, `constraint`, or `procedure`.
 - `source`: the local client or source that supplied the record. For durable Task 7 writes, `synapse-store` treats this value as the claimed client identity checked by the local authorization policy.
+- `scope` and `key`: an optional paired logical address for knowledge that unrelated tools should be able to refer to without agreeing on the same prose. Example: `scope = machine`, `key = toolchain.rust.compiler_path`.
 - `created_at_unix_ms`: caller-supplied creation time represented as Unix milliseconds.
 - `confidence`: `unknown`, `low`, `medium`, or `high`.
 - `state`: `active`, `stale`, `conflicted`, `superseded`, or `unknown`.
 - `provenance`: whether the knowledge was `observed` or `inferred`, plus optional provenance detail.
 
-`id`, `content`, `kind`, and `source` must contain non-whitespace text. Validation applies both when records are constructed in Rust and when records are deserialized, so serialized input cannot bypass those invariants.
+`id`, `content`, `kind`, and `source` must contain non-whitespace text. `scope` and `key` are optional for legacy/unaddressed knowledge, but they must either both be absent or both contain non-whitespace text. Validation applies both when records are constructed in Rust and when records are deserialized, so serialized input cannot bypass those invariants.
 
 ## Design decisions
 
@@ -30,6 +31,12 @@ An observation is information a source directly obtained from the machine or ano
 ### Confidence and lifecycle state are separate
 
 Confidence describes certainty in a record. Lifecycle state describes whether the record is currently usable, stale, conflicted, superseded, or not yet classified. Keeping them separate allows future retrieval logic to handle uncertainty without deleting provenance or history.
+
+### Record identity and logical address are different
+
+The immutable record `id` identifies one historical assertion. The optional `scope + key` pair identifies what that assertion is about. Multiple active records are allowed to share the same logical address; Synapse does not silently turn the address into a unique primary key or select one writer as truth. Clients can preserve disagreement explicitly and use lifecycle relations to supersede or conflict records when evidence justifies it.
+
+Scopes are caller-defined namespaces such as `machine` or `project:<stable-project-id>`. Keys are caller-defined stable names such as `toolchain.rust.compiler_path`. The core validates shape only; it does not maintain a registry of allowed scopes or keys.
 
 ### Identity and time policy stay outside the core
 
@@ -44,7 +51,7 @@ The record implements Serde serialization. Task 2 introduced `synapse knowledge 
 The current proof command is:
 
 ```text
-synapse knowledge create <id> <kind> <source> <observed|inferred> <unknown|low|medium|high> <content>
+synapse knowledge create <id> <kind> <source> <observed|inferred> <unknown|low|medium|high> <content> [--scope <scope> --key <key>]
 ```
 
 The CLI supplies the current Unix-millisecond timestamp and initially marks newly created records as `active`. The output is a serialized `KnowledgeRecord` suitable for inspection or piping to another local process.

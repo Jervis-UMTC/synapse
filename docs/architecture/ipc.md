@@ -8,17 +8,28 @@ The design remains local-first and framework-agnostic. It uses local sockets rat
 
 ## Transport
 
-`synapse-ipc` uses `interprocess` local sockets with a namespaced endpoint derived from the SHA-256 of the configured store-root path. On the current Windows development target this is a local named pipe. On Unix targets the same abstraction resolves to the platform local-socket implementation.
+`synapse-ipc` uses `interprocess` local sockets with a namespaced endpoint derived from the durable store ID in `store-identity-v1.json`, not from the current spelling of the store-root path. On the current Windows development target this is a local named pipe. On Unix targets the same abstraction resolves to the platform local-socket implementation.
 
-The protocol is versioned by the current implementation contract and uses one request per connection. Each frame is a four-byte big-endian length followed by JSON. Frames are bounded to 12 MiB. Accepted streams are placed in nonblocking mode and frame reads/writes must make progress within three seconds; a stalled peer therefore cannot hold one service request indefinitely.
+The identity is bootstrapped lazily by `FileStore::store_id`. For a pre-identity store, the initial 64-hex-character ID is the full SHA-256 digest from the original path-based endpoint algorithm, and the endpoint continues using that digest's first 16 bytes. Therefore an existing store first opened at the same configured path keeps its previous endpoint name during upgrade. Once persisted, the ID travels with the store: equivalent path aliases resolve to the same endpoint and moving the complete directory does not rename it. A live service must still be restarted/reopened after a physical move so its file-store root points at the new location.
+
+The store ID is not secret or an authentication factor. Copying the identity file creates another store with the same endpoint identity, so simultaneously active clones can collide; Synapse currently leaves clone/fork identity management explicit rather than mutating copied metadata automatically.
+
+The protocol uses one request per connection. Each frame is a four-byte big-endian length followed by JSON and is bounded to 12 MiB. The current protocol is version `2`. Frames from the original Task 8 implementation that omit `protocol_version` are treated as protocol v1 for backward compatibility; explicit v1 and v2 frames are accepted, while later unsupported versions are rejected.
+
+Protocol v2 introduces `scope + key` addressed knowledge without allowing a downgrade to silently erase those fields. Address-aware writes and address-filtered queries are encoded with v2-only operation names (`insert_addressed_record`, `insert_addressed_successor`, and `query_addressed`). A pre-v2 server therefore rejects the unknown operation instead of deserializing a familiar request and ignoring the new record fields. A current server responds using the valid request's protocol version; if a v1 read would return an addressed record, it returns an upgrade-required error rather than sending data whose address a legacy client does not understand.
+
+Addressless v1 operations remain compatible. The protocol version is independent from the executable-trust-entry format version and the endpoint namespace version, so the v2 knowledge contract does not invalidate trusted executables or rename the local endpoint.
+
+Accepted streams are placed in nonblocking mode. Once frame transfer begins, reads and writes must make progress within three seconds; the deadline resets whenever bytes move. A client allows up to ten seconds for the first response bytes so bounded server-side authentication and store-lock acquisition are not incorrectly counted as stalled frame I/O. On bounded Windows named-pipe buffers, a write that cannot accept the requested chunk is retried with progressively smaller chunks until progress is possible; the length-prefixed wire format is unchanged.
 
 Current request operations are:
 
 - `ping`;
-- insert a `KnowledgeRecord`;
+- insert an addressless or addressed `KnowledgeRecord`;
 - insert a `KnowledgeRelation`;
+- atomically insert an addressless or addressed successor `KnowledgeRecord` together with its `Supersedes` relation;
 - exact record lookup;
-- bounded `KnowledgeQuery` discovery;
+- bounded `KnowledgeQuery` discovery, including exact `scope` / `key` filters;
 - record lifecycle status.
 
 The IPC layer reuses `synapse-core` and `synapse-store` data contracts rather than defining a second knowledge model.
@@ -35,8 +46,8 @@ For each write the service:
 4. SHA-256 hashes the executable, with a 512 MiB input bound;
 5. refreshes the process and verifies that the PID still has the same start time and executable path;
 6. maps the executable fingerprint to exactly one trusted Synapse client ID;
-7. requires `KnowledgeRecord.source` or `KnowledgeRelation.source` to equal that authenticated client ID;
-8. invokes `synapse-store`, which still enforces Task 7 `write_records` / `write_relations` capability checks.
+7. requires `KnowledgeRecord.source` or `KnowledgeRelation.source` to equal that authenticated client ID; for an atomic successor both nested sources must equal it;
+8. invokes `synapse-store`, which still enforces Task 7 `write_records` / `write_relations` capability checks. Atomic successor publication requires both capabilities.
 
 This removes the Task 7 behavior where an IPC writer could select any permitted `source` string by claim alone. Source identity is still preserved in the authoritative record/relation, but the IPC service now checks that the connected process maps to it.
 
